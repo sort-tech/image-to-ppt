@@ -30,3 +30,9 @@ yarn-error.log*
 .DS_Store
 .idea/
 .vscode/
+
+# --- Claude Code ------------------------------------------------------------
+# .claude/launch.json IS shared (it just says "start the stack with ./run.sh").
+# Personal overrides and local state are not.
+.claude/settings.local.json
+.claude/*.local.json

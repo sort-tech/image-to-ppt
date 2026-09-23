@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "image-to-ppt",
+      "runtimeExecutable": "./run.sh",
+      "runtimeArgs": [],
+      "port": 5173
+    }
+  ]
+}
