@@ -1231,6 +1231,63 @@ class TestAddPicture:
         assert picture.width > 0
 
 
+class TestTheDescriptionReachesTheDeck:
+    """``description`` must be WRITTEN into the deck, not just parsed.
+
+    Regression: the builder placed the crop and dropped the description on the
+    floor, while ``services.preview`` - which derives its payload from the built
+    deck - read the description back off the picture's alt text. Both sides were
+    tested in isolation and both passed, so every ``image`` element silently
+    previewed with ``description: null``. The alt text is the seam between them,
+    so it is asserted here and in ``test_preview`` from the other side.
+    """
+
+    @staticmethod
+    def _alt(shape) -> str | None:
+        return shape._element._nvXxPr.cNvPr.get("descr")
+
+    def test_the_description_is_written_as_alt_text(self):
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide,
+            ImageElement(type="image", bbox=[100, 100, 200, 200], description="팀 사진"),
+            _source_bytes(),
+        )
+        assert self._alt(picture) == "팀 사진"
+
+    def test_the_alt_text_survives_a_save_and_reload(self, tmp_path):
+        spec = SlideSpec(
+            elements=[
+                TextElement(type="text", bbox=[0, 0, 400, 80], content="제목"),
+                ImageElement(
+                    type="image", bbox=[600, 200, 250, 300], description="현장 사진"
+                ),
+            ]
+        )
+        out = build_pptx(spec, tmp_path / "descr.pptx", source_image=_source_bytes())
+        picture = _pictures(Presentation(str(out)).slides[0])[0]
+        assert self._alt(picture) == "현장 사진"
+
+    @pytest.mark.parametrize("description", [None, "", "   "])
+    def test_no_description_leaves_only_python_pptx_own_default(self, description):
+        """A blank label must not be written - and never as the string ``"None"``.
+
+        ``add_picture`` sets ``descr="image.png"`` itself, so "wrote nothing" shows
+        up as that untouched default rather than an empty attribute. That is the
+        exact value ``services.preview`` discards as a filename, which is why a
+        missing description previews as ``null`` and not as "image.png".
+        """
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide,
+            ImageElement(type="image", bbox=[100, 100, 200, 200], description=description),
+            _source_bytes(),
+        )
+        alt = self._alt(picture) or ""
+        assert alt != "None", "a None description leaked into the deck as text"
+        assert alt in ("", "image.png"), f"unexpected alt text {alt!r}"
+
+
 # ---------------------------------------------------------------------------
 # a missing source image: skipped, reported, and marked in the deck
 # ---------------------------------------------------------------------------

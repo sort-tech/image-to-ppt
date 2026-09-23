@@ -16,13 +16,20 @@ from pathlib import Path
 import pytest
 from PIL import Image
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from app import config
 import cli
 from app import mock_data
 from app import vision_analyzer
 from make_sample_image import make_sample_image
-from app.schemas import ShapeElement, SlideSpec, TableElement, TextElement
+from app.schemas import (
+    ImageElement,
+    ShapeElement,
+    SlideSpec,
+    TableElement,
+    TextElement,
+)
 from app.vision_analyzer import VisionAnalysisError
 
 
@@ -335,6 +342,75 @@ class TestAnalyzePath:
         assert _run(["--input", str(png), "--output", str(out)]) == 0
         assert recorder["image_path"].name == png.name
         _assert_real_deck(out)
+
+    def test_the_analyzed_image_is_handed_to_the_builder_for_cropping(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Regression: ``--input`` HAS the source image, so a crop must happen.
+
+        ``main`` called ``build_pptx(spec, out)`` and never passed the image it
+        had just analyzed, so an ``image`` element was skipped with "there is no
+        source image to crop from" on the one code path that did have one -
+        sub-images were dead from the CLI. Asserted on the deck, not on a mock:
+        a real picture shape has to come out.
+        """
+        png = _sample_png(tmp_path)
+        spec = SlideSpec(
+            elements=[
+                TextElement(type="text", bbox=[10, 10, 400, 80], content="제목"),
+                ImageElement(
+                    type="image", bbox=[600, 200, 250, 300], description="사진 영역"
+                ),
+            ]
+        )
+        _patch_analyzer(
+            monkeypatch,
+            lambda image_path, **kwargs: spec,
+        )
+        out = tmp_path / "cropped.pptx"
+
+        assert _run(["-i", str(png), "-o", str(out)]) == 0
+        pictures = [
+            s
+            for s in Presentation(str(out)).slides[0].shapes
+            if s.shape_type == MSO_SHAPE_TYPE.PICTURE
+        ]
+        assert len(pictures) == 1, "the image element was not cropped from --input"
+        assert "no source image" not in capsys.readouterr().err
+
+    def test_the_summary_does_not_claim_everything_is_native_over_a_picture(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Regression: "All objects are native ... " printed over a photo.
+
+        Once ``image`` elements existed the line became a false claim, and this
+        project's rule is that every claim shown to a user must be true. The
+        summary now counts the pictures really in the written deck.
+        """
+        png = _sample_png(tmp_path)
+        spec = SlideSpec(
+            elements=[
+                TextElement(type="text", bbox=[10, 10, 400, 80], content="제목"),
+                ImageElement(type="image", bbox=[600, 200, 250, 300]),
+            ]
+        )
+        _patch_analyzer(monkeypatch, lambda image_path, **kwargs: spec)
+
+        assert _run(["-i", str(png), "-o", str(tmp_path / "claim.pptx")]) == 0
+        out = capsys.readouterr().out
+        assert "All objects are native" not in out, "false claim over an embedded picture"
+        assert "1 cropped image region embedded as picture" in out
+        assert "native PowerPoint shape/table/text box" in out
+
+    def test_the_native_claim_still_stands_when_nothing_was_cropped(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A deck with no picture keeps the original, still-true sentence."""
+        png = _sample_png(tmp_path)
+        _patch_analyzer(monkeypatch, lambda image_path, **kwargs: mock_data.sample_spec())
+
+        assert _run(["-i", str(png), "-o", str(tmp_path / "native.pptx")]) == 0
+        assert "All objects are native" in capsys.readouterr().out
 
     def test_model_and_extra_flags_are_forwarded(self, tmp_path, monkeypatch):
         recorder: dict = {}
