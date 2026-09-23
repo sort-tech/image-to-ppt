@@ -220,6 +220,13 @@ allow-list (`http://localhost:5173`, `http://localhost:3000`) exists for.
 | `LITELLM_API_KEY` | *(empty - no default)* | key the proxy expects. **Required for a real conversion**; any value your proxy accepts will do, including a dummy one for a local proxy that does not check |
 | `VISION_MODEL` | `gemini-flash` | model / alias to request. Overridable per request (`model` field) or per run (`-m`) |
 
+A variable that is **present but blank** (`VISION_MODEL=` on its own line in
+`.env`) counts as unset and falls back to the default above. It used to be
+copied through as `""`, and nothing downstream could recover it: the proxy
+answered `Invalid model name passed in model=` and `/api/health` reported no
+model at all, which the UI's status pill - the only place the model is named
+since the picker went - rendered as a dangling ` · 키 설정됨`.
+
 There are two ways to set them. **A `.env` file** in the repository root is the
 easy one - it is git-ignored and loaded automatically:
 
@@ -474,6 +481,92 @@ Errors:
 | 502 | `proxy_unreachable` | the proxy could not be reached (the hint names `LITELLM_BASE_URL`) |
 | 502 | `analysis_failed` | the model replied but the reply could not be used |
 | 500 | `build_failed` | the deck could not be built - and the code for any other unexpected failure of the pipeline, so this table is the whole error surface |
+
+### `POST /api/refine-instructions` (`multipart/form-data`) → 200
+
+Completes a rough note into ONE instruction written for the slide analyzer, in
+the note's own language, ready to paste into `extra_instructions` on the next
+`/api/convert`.
+
+The flow it exists for: convert, look at the preview, spot something wrong, type
+"표가 이상해", and get back an instruction that actually names the element. That
+is why **context matters** - with only the bare note there is nothing to do but
+tidy the grammar.
+
+| field | type | required | meaning |
+| --- | --- | --- | --- |
+| `note` | string | **yes** | the rough text, in any language |
+| `spec` | string | no | the current `SlideSpec` as JSON, when a conversion has already happened. Parsed leniently: an unusable value is **ignored, not rejected** - it is only context |
+| `file` | file | no | the source image, used when there is no spec yet |
+| `model` | string | no | overrides `VISION_MODEL` for this request |
+
+Context is picked cheapest-first and **reported rather than assumed**: `spec`
+when it parses and has elements (text-only, no vision call), otherwise `file`
+(one vision call), otherwise neither. `context_used` says which it really was,
+so the UI can name the context instead of implying the best case.
+
+The spec is **summarized, never dumped** - a 14-element spec as raw JSON is
+thousands of tokens of bbox integers the model cannot use to work out which
+element the note means. What goes up is a capped digest of
+`type - rough position in words - rough extent in words - short excerpt`, with
+no coordinates and no sizes in figures at all (for `backend/sample.png`: under a
+thousand characters against 2,614 of raw JSON).
+
+The extent is words for the same reason the position is: a digest that carried
+`460x5` got the numbers quoted straight back at the analyzer, which has its own
+idea of the 0..1000 grid. But it has to be there - without it a 460x5 divider
+and a full-slide card produced identical lines, so `구분선이 너무 두꺼워` had
+nothing to attach to and mis-targeted the header band in 5 of 8 sampled runs.
+`얇은 가로선`, `가로로 넓고 낮은 띠`, `큰 영역`, `작은 영역` and the rest carry
+that much and cost a handful of characters.
+
+An unusable `spec` is ignored rather than rejected, and that holds for one that
+*parses* and then cannot be encoded: a lone surrogate (`"\ud800"`) survives
+`json.loads` but no UTF-8 encoder, and it used to fail inside the HTTP client
+rather than here. Strings that reach the digest are sanitized where they are
+built, so the assist still works for that caller.
+
+```json
+{
+  "status": "success",
+  "instruction": "우측 중앙 영역은 3열 3행의 단일 표로 인식하세요. 첫 행(Region | Users | Growth)을 헤더로 지정하고, 셀 내부의 텍스트를 개별 텍스트 상자로 분리하지 마세요.",
+  "note": "표가 이상해",
+  "context_used": "spec",
+  "fell_back": false
+}
+```
+
+`instruction` is **never empty**, by construction: the UI writes it straight
+into the box the user typed in, so an empty value would delete their own words.
+If the model returns nothing usable the tidied note comes back instead,
+`context_used` is downgraded to `"none"` - claiming the slide informed an answer
+that is only the user's own sentence would be a lie - and `fell_back` is `true`.
+
+`fell_back` is there because `context_used` alone cannot tell two different
+events apart. Both answer `"none"`: a genuine no-context run, where the model
+really does write an instruction from the note alone, and this fallback, where a
+digest *was* built and sent and nothing came back. They need different sentences
+on screen, and the UI prints one of them - so "there was no analysis or image"
+must not be said about a request that carried one.
+
+```bash
+curl -s -F 'note=표가 이상해' -F 'spec=<spec.json' \
+     http://127.0.0.1:8000/api/refine-instructions
+```
+
+Errors:
+
+| status | `code` | when |
+| --- | --- | --- |
+| 400 | `empty_note` | `note` missing or blank after trimming. Checked before the optional `file`, so a caller who forgot the note gets the code that names what they forgot |
+| 400 | `empty_file` / `not_an_image` | a `file` part with a filename but no bytes, or bytes Pillow cannot decode |
+| 413 | `file_too_large` | over the same 20 MB cap as `/api/convert` |
+| 503 | `missing_api_key` | `LITELLM_API_KEY` unset/blank |
+| 502 | `proxy_unreachable` | the proxy could not be reached |
+| 502 | `refine_failed` | the model was reached but gave nothing usable |
+
+There is no `build_failed` here: nothing is built. A malformed `spec` is not an
+error at all - it degrades to the next context down and says so.
 
 ### `POST /api/preview` (`application/json`) → 200
 
@@ -1049,7 +1142,10 @@ curl -s -H "Authorization: Bearer $LITELLM_API_KEY" "${BASE%/}/v1/models"
 `${BASE%/}` strips the trailing slash the default carries; plain
 `$LITELLM_BASE_URL/v1/models` would request `//v1/models` and get a 404 from the
 proxy itself. Override the model per request with the `model` field, or per run
-with `-m`.
+with `-m`. In the **browser** there is no model field any more, so the fix there
+is `VISION_MODEL` in `.env` plus a backend restart - which is what the Korean
+copy for `analysis_failed` now tells you, since the same code covers a model
+that never answered and a model whose answer could not be used.
 
 **CORS error in the browser console.** The dev UI should never hit this: Vite
 serves on :5173 and proxies `/api` to :8000, so requests are **same-origin**.

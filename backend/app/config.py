@@ -17,6 +17,24 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover - typing only, never executed at runtime
     import openai
 
+
+def _env_text(name: str, default: str) -> str:
+    """An environment variable as text, falling back when it is BLANK too.
+
+    ``os.environ.get(name, default)`` falls back only when the variable is
+    absent. A hand-edited ``.env`` line like ``VISION_MODEL=`` is present and
+    empty, and the project's ``.env`` loader copies exactly that into the
+    environment - so the documented default became unreachable and the blank
+    travelled on: the proxy answers ``Invalid model name passed in model=``, and
+    ``/api/health`` reported an empty model, which the UI's status pill - the
+    only place the model is named now that there is no picker - rendered as a
+    dangling separator. Whitespace is stripped for the same reason the route
+    strips the per-request ``model``: "   " is not a model name either.
+
+    House rule: configuration falls back rather than breaks.
+    """
+    return (os.environ.get(name) or "").strip() or default
+
 __all__ = [
     "LITELLM_BASE_URL",
     "LITELLM_API_KEY",
@@ -40,7 +58,7 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 #: Base URL of the OpenAI-compatible LiteLLM proxy (env: ``LITELLM_BASE_URL``).
-LITELLM_BASE_URL: str = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000/")
+LITELLM_BASE_URL: str = _env_text("LITELLM_BASE_URL", "http://localhost:4000/")
 
 #: API key presented to the proxy (env: ``LITELLM_API_KEY``). There is
 #: deliberately NO default: a credential does not belong in the source tree, and
@@ -49,8 +67,9 @@ LITELLM_BASE_URL: str = os.environ.get("LITELLM_BASE_URL", "http://localhost:400
 #: while ``--from-json`` never needs a key at all.
 LITELLM_API_KEY: str = os.environ.get("LITELLM_API_KEY", "")
 
-#: Vision model name routed by the proxy (env: ``VISION_MODEL``).
-DEFAULT_MODEL: str = os.environ.get("VISION_MODEL", "gemini-flash")
+#: Vision model name routed by the proxy (env: ``VISION_MODEL``). A blank value
+#: falls back to the default - see :func:`_env_text`.
+DEFAULT_MODEL: str = _env_text("VISION_MODEL", "gemini-flash")
 
 #: Per-request timeout in seconds. Vision calls on large images are slow.
 LLM_TIMEOUT: float = 120.0

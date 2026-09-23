@@ -235,6 +235,133 @@ class TestStaleResultIsCleared:
         assert "onClear={() => chooseFile(null)}" in text
 
 
+class TestTheAssistOnlyClaimsWhatHappened:
+    """The status line under the instructions box describes a round trip the
+    user cannot see, so every word of it has to be true of what the server
+    actually did. Three of them were not.
+    """
+
+    @staticmethod
+    def _context_note() -> str:
+        """Just the ``CONTEXT_NOTE`` literal - the sentences that reach a user.
+
+        Scoped deliberately: the comments around it quote the old wording in
+        order to explain why it was wrong, and a whole-file scan would forbid
+        recording that.
+        """
+        panel = source("components", "OptionPanel.tsx")
+        head = "const CONTEXT_NOTE: Record<RefineContext, string> = {"
+        assert head in panel, "CONTEXT_NOTE changed shape - re-point this guard"
+        block = panel.split(head, 1)[1].split("};", 1)[0]
+        assert "spec:" in block and "image:" in block and "none:" in block, block
+        return block
+
+    def test_the_spec_line_names_the_slide_on_screen_not_the_last_conversion(self):
+        """``currentSpec`` is ``edited.payload`` whenever an edited preview is
+        showing, i.e. the user's own hand-edited Spec JSON - so "직전 변환의"
+        (the PREVIOUS conversion's) analysis named the one thing the assist did
+        not use."""
+        context_note = self._context_note()
+        assert "직전 변환" not in context_note, (
+            "the spec context line claims the previous conversion's analysis "
+            f"again, which is false as soon as the user edits the spec: "
+            f"{context_note}"
+        )
+        assert "현재 화면의 슬라이드 분석 결과" in context_note
+
+    def test_the_no_context_line_does_not_claim_the_note_was_only_tidied(self):
+        """With no context the model still WRITES an instruction - it rewrote
+        "표가 이상해" into a full imperative sentence - so "메모 문장만
+        다듬었습니다" described something that did not happen. That wording is
+        only true of the fallback, which now has its own line."""
+        context_note = self._context_note()
+        assert "문장만 다듬었습니다" not in context_note, context_note
+        assert "없어" not in context_note, (
+            "a context line blames a missing context again; the fallback case "
+            "is reported separately because there the context was usually there"
+        )
+
+    def test_the_fallback_has_its_own_line_and_offers_no_undo(self):
+        """Server-side, ``fell_back`` is the flag that tells a model that gave
+        nothing back from a genuine no-context run - both answer
+        ``context_used == "none"``. The UI has to read it, or it states a cause
+        (no spec, no image) that did not happen and offers a 되돌리기 that
+        restores identical text."""
+        app_source = source("App.tsx")
+        panel = source("components", "OptionPanel.tsx")
+        client = source("api", "client.ts")
+
+        assert "fell_back" in client, "the client drops the fallback flag"
+        assert "fellBack" in app_source, "App.tsx ignores the fallback flag"
+        assert "fellBack" in panel, "the panel does not describe a fallback"
+        assert "모델이 문장을 완성하지 못해" in panel
+
+        # The undo is offered only when the box really changed.
+        body = app_source.split("const handleRefine", 1)[1].split(
+            "const changeExtraInstructions", 1
+        )[0]
+        assert re.search(r"changed\s*=\s*data\.instruction !== rough", body), (
+            "the assist no longer checks whether it changed anything, so a "
+            "fallback that returned the note verbatim still offers an undo"
+        )
+        assert re.search(r"setPreRefineNote\(changed \?", body), body
+
+
+class TestAnAssistInFlightIsCancelledNotIgnored:
+    """A reply is only meaningful for the note AND the context it was sent
+    with. Every path that changes either has to cancel the request, or the
+    reply lands on top of what replaced it.
+
+    Measured before the fix: 되돌리기 restored the user's sentence, the earlier
+    run's reply landed 2 seconds later, and that sentence was gone from state -
+    a second 되돌리기 then restored the machine text instead of it. Swapping the
+    image left "선택한 이미지를 참고해 완성했습니다" beside a different image, and
+    clearing it left the same line beside no image at all.
+    """
+
+    #: Every handler that changes the note or the assist's context.
+    CANCELLING_HANDLERS = (
+        ("const changeExtraInstructions", "typing in the box"),
+        ("const handleUndoRefine", "되돌리기 - itself an edit of the box"),
+        ("const chooseFile", "choosing or clearing the image"),
+        ("const handleRefreshPreview", "refreshing the preview from edited JSON"),
+        ("const handleRevert", "reverting to the converted spec"),
+        ("const handleConvert", "converting, which replaces the spec"),
+    )
+
+    def test_every_path_that_changes_the_context_cancels_the_request(self):
+        app_source = source("App.tsx")
+        assert "const cancelRefine" in app_source, (
+            "the shared cancel is gone - re-point this guard"
+        )
+        missing = []
+        for marker, what in self.CANCELLING_HANDLERS:
+            assert marker in app_source, f"{marker} is gone - re-point this guard"
+            body = app_source.split(marker, 1)[1].split("\n  }, [", 1)[0]
+            if "cancelRefine()" not in body and "refineAbort.current?.abort()" not in body:
+                missing.append(what)
+        assert missing == [], (
+            "these paths change what the assist was asked about without "
+            f"cancelling it, so a stale reply can still land: {missing}"
+        )
+
+    def test_a_reply_is_also_dropped_when_the_box_no_longer_holds_its_note(self):
+        """The second half: an abort that is ever missed must not be the only
+        thing standing between a stale reply and the user's text."""
+        app_source = source("App.tsx")
+        body = app_source.split("const handleRefine", 1)[1].split(
+            "const changeExtraInstructions", 1
+        )[0]
+        assert "noteRef.current !== rough" in body, (
+            "the landing path trusts the abort alone; a reply whose rough note "
+            "is no longer in the box must be dropped"
+        )
+        landing = body.find("noteRef.current !== rough")
+        assert landing < body.find("setExtraInstructions("), (
+            "the guard runs after the textarea has already been overwritten"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # The UI is Korean: the copy has to read like Korean, and cover every code
 # --------------------------------------------------------------------------- #
@@ -435,6 +562,104 @@ class TestMockModeIsGoneFromTheFrontendToo:
 
 
 # --------------------------------------------------------------------------- #
+# The Vision model picker is hidden, and the configured model still shows
+# --------------------------------------------------------------------------- #
+class TestTheModelPickerStaysOffTheScreen:
+    """The model is the SERVER's choice (``VISION_MODEL`` ->
+    ``config.DEFAULT_MODEL``) and the UI no longer offers to change it.
+
+    The backend's ``model`` form field is deliberately KEPT - API clients and
+    the CLI's ``-m`` use it, and ``test_api.py`` asserts it stays in the schema
+    - so nothing on the server side would fail if a control reappeared here.
+    That makes these the only checks standing between a re-added input and a
+    user who sets a model that silently disagrees with the one the status pill
+    reports.
+    """
+
+    def test_no_model_control_is_rendered(self):
+        """The removed control, by every name it had: the id that tied its
+        label to its input, its two props, and its state setter.
+
+        ``modelId`` rather than the visible "Vision 모델" label text: the label
+        is on its own line in JSX, so no single literal spans it, and the id is
+        what a re-added ``<label htmlFor=...>``/``<input id=...>`` pair needs in
+        order to be an accessible field at all.
+        """
+        offenders = []
+        for path in copy_files():
+            text = path.read_text(encoding="utf-8")
+            for needle in (
+                "modelId",
+                "onModelChange",
+                "modelPlaceholder",
+                "setModel(",
+            ):
+                if needle in text:
+                    offenders.append(f"{path.relative_to(FRONTEND)}: {needle}")
+        assert offenders == [], (
+            f"a Vision model control is back on the screen: {offenders}"
+        )
+
+    def test_the_convert_call_sends_no_model_field(self):
+        """The other half of it: a control is useless without a ``model`` part
+        on the request, and a ``model`` part is what would override the
+        configured value. Neither may exist."""
+        client = source("api", "client.ts")
+        assert 'append("model"' not in client, (
+            "client.ts appends a `model` form field again, so the UI - not the "
+            "server's VISION_MODEL - decides the model"
+        )
+        # `spec`, `note` and `file` are the parts the client legitimately sends.
+        appended = set(re.findall(r'append\(\s*"([a-z_]+)"', client))
+        assert "model" not in appended, sorted(appended)
+
+    def test_the_convert_input_type_has_no_model_field(self):
+        """A `model?: string` on ``ConvertInput`` would type-check at the call
+        site and then be dropped on the floor by ``convert()``. The field is
+        gone so the compiler catches that instead."""
+        types = source("types", "slide.ts")
+        match = re.search(
+            r"export interface ConvertInput \{(.*?)\n\}", types, re.DOTALL
+        )
+        assert match, "ConvertInput is no longer declared - re-point this guard"
+        assert "model" not in match.group(1), (
+            "ConvertInput declares a `model` field again, but convert() does "
+            "not send one - it would be a knob that silently does nothing"
+        )
+
+    def test_the_configured_model_is_still_shown(self):
+        """Hiding the CONTROL must not hide the FACT. The header pill is the
+        only place left that names the model, so it has to keep reading it from
+        /api/health."""
+        app_source = source("App.tsx")
+        assert re.search(r"health\??\.proxy\.model", app_source), (
+            "the header status pill no longer shows the configured model, so "
+            "nothing on screen says which Vision model ran"
+        )
+
+    def test_a_blank_model_is_not_rendered_as_a_dangling_separator(self):
+        """The pill's text was ```${health.proxy.model} · 키 설정됨```, so a
+        blank model rendered " · 키 설정됨" - a separator with nothing in front
+        of it, in the one place on screen that is supposed to name the model,
+        and with no field left to type one into. ``VISION_MODEL=`` in a
+        hand-edited ``.env`` produced exactly that (``config`` now falls back
+        before it can, and this is the other half of the guard).
+        """
+        app_source = source("App.tsx")
+        assert not re.search(r"\$\{health\??\.proxy\.model\}", app_source), (
+            "the pill interpolates /api/health's model straight into its text "
+            "again, so a blank value renders as a dangling separator"
+        )
+        fallback = re.search(r"const model(?:Text)? = [^;]*\|\|[^;]*;", app_source)
+        assert fallback, "the blank-model fallback is gone - re-point this guard"
+        assert HANGUL.search(fallback.group(0)), (
+            "a blank model must fall back to Korean copy that says so, not to "
+            "another blank: "
+            f"{fallback.group(0)}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Every code the backend can emit needs Korean copy in the client
 # --------------------------------------------------------------------------- #
 BACKEND = Path(__file__).resolve().parents[1] / "app"
@@ -548,7 +773,35 @@ class TestTheKoreanBannerDoesNotStackEnglishUnderneath:
             "build_failed",
             "invalid_request",
             "bad_request",
+            # ``refine_failed`` belongs with ``analysis_failed``: its hint quotes
+            # the (scrubbed) upstream text, which is the one thing a fixed
+            # Korean sentence cannot know.
+            "refine_failed",
         }, f"the set of codes that append server detail changed: {sorted(keeps)}"
+
+    def test_analysis_failed_does_not_assert_that_the_model_replied(self):
+        """``analysis_failed`` is also the code for "the configured model does
+        not exist on the proxy" (README documents it, and the proxy answers
+        ``Invalid model name passed in model=...``). In that case nothing
+        replied at all, so "모델 응답을 슬라이드 정보로 읽을 수 없었습니다" stated a
+        cause that did not happen - and both remedies it offered (a sharper
+        image, extra instructions) cannot help. Typing another model name used
+        to be the workaround; the UI has no field for that any more, so the copy
+        has to name the one remedy that is left.
+        """
+        body = error_copy_entries()["analysis_failed"]
+
+        assert "VISION_MODEL" in body, (
+            "the only remaining way to change the model is .env's "
+            "VISION_MODEL, and the copy never mentions it"
+        )
+        # It may offer the image advice - it is one of the real causes - but it
+        # must not present "the model answered" as established fact.
+        assert "모델 응답을" not in body, body
+        assert "이미지를 분석하지 못했습니다" not in body, (
+            "the message still says the model failed to ANALYZE the image, "
+            "which is wrong when the request never reached a model: " + body
+        )
 
     def test_every_entry_is_korean(self):
         for code, body in error_copy_entries().items():

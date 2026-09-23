@@ -552,6 +552,37 @@ class TestConvertAnalyzed:
         assert analyze.calls[0]["model"] is None
         assert analyze.calls[0]["extra_instructions"] is None
 
+    def test_an_omitted_model_field_uses_the_server_default(
+        self, client, png_bytes, with_key, monkeypatch
+    ):
+        """The UI no longer has a model control, so it sends no ``model`` at
+        all. That must keep using ``config.DEFAULT_MODEL`` (from
+        ``VISION_MODEL``) rather than becoming a blank model name: the route
+        passes ``None`` and the analyzer resolves it - see
+        ``test_vision_analyzer.py::test_model_defaults_to_config``."""
+        analyze = fake_analyzer()
+        monkeypatch.setattr(vision_analyzer, "analyze_image", analyze)
+
+        response = client.post("/api/convert", files=upload(png_bytes))
+
+        assert response.status_code == 200
+        assert analyze.calls[0]["model"] is None
+        # ...and the configured model is still what the UI can SHOW, so hiding
+        # the control does not hide which model ran.
+        assert client.get("/api/health").json()["proxy"]["model"] == config.DEFAULT_MODEL
+
+    def test_the_model_form_field_stays_in_the_api(self, client):
+        """Hidden on the SCREEN, kept in the contract: API clients and the
+        CLI's ``-m`` still need it, so a UI cleanup must not delete it."""
+        schema = client.get("/openapi.json").json()
+        body = schema["paths"]["/api/convert"]["post"]["requestBody"]
+        ref = body["content"]["multipart/form-data"]["schema"]["$ref"]
+        fields = schema["components"]["schemas"][ref.rsplit("/", 1)[-1]]["properties"]
+
+        assert "model" in fields
+        assert "extra_instructions" in fields
+        assert schema["paths"]["/api/convert"]["post"]["requestBody"]["required"]
+
     def test_the_temp_upload_file_is_removed_afterwards(
         self, client, png_bytes, with_key, monkeypatch
     ):
@@ -865,6 +896,367 @@ class TestConvertErrors:
         assert "secret internal detail" not in response.text
         assert "Traceback" not in response.text
         assert ".py" not in response.text
+
+
+# =========================================================================== #
+# POST /api/refine-instructions
+# =========================================================================== #
+#: A plausible completed instruction, in the note's language (Korean).
+REFINED = (
+    "우측 중앙의 3열 3행 표를 하나의 표로 인식하고, 첫 행을 헤더로 지정하세요."
+)
+
+
+class _FakeCompletions:
+    """Records the call, so a test can assert what the route actually sent."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        message = type("_M", (), {"content": self.reply, "refusal": None})()
+        choice = type("_C", (), {"message": message, "finish_reason": "stop"})()
+        return type("_R", (), {"choices": [choice]})()
+
+
+class _FakeClient:
+    def __init__(self, reply=REFINED):
+        self.chat = type("_Chat", (), {})()
+        self.chat.completions = _FakeCompletions(reply)
+
+    @property
+    def calls(self) -> list[dict]:
+        return self.chat.completions.calls
+
+
+@pytest.fixture
+def offline_refine(monkeypatch, with_key):
+    """The real ``/api/refine-instructions`` path, offline.
+
+    ``config.get_client`` is what ``instructions.refine_instruction`` calls
+    when no client is injected, so replacing it exercises the whole route -
+    form parsing, upload validation, context selection and the response
+    envelope - without the network. Returns the fake, so a test can assert on
+    the prompt that was built.
+    """
+    fake = _FakeClient()
+    monkeypatch.setattr(config, "get_client", lambda: fake)
+    return fake
+
+
+class TestRefineInstructions:
+    """The HTTP layer of the instruction assist.
+
+    ``tests/test_instructions.py`` covers the service in depth and is
+    framework-free by design, so it cannot reach any of this: the multipart
+    parsing, the optional file part, the order the route validates things in,
+    or the status codes. Those live here.
+    """
+
+    URL = "/api/refine-instructions"
+
+    def test_a_note_and_a_spec_answer_the_pinned_contract(
+        self, client, offline_refine
+    ):
+        response = client.post(
+            self.URL,
+            data={"note": "표가 이상해", "spec": json.dumps(spec_dict())},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == {
+            "status",
+            "instruction",
+            "note",
+            "context_used",
+            # Beside ``context_used``, not inside it: the three pinned context
+            # values keep their meaning, and this says whether the model
+            # produced anything at all. Without it the UI cannot tell a genuine
+            # no-context run from an echo of the user's own note, and it prints
+            # a sentence about each.
+            "fell_back",
+        }
+        assert body["status"] == "success"
+        assert body["instruction"] == REFINED
+        # Echoed EXACTLY as received - the UI needs it to offer an undo.
+        assert body["note"] == "표가 이상해"
+        assert body["context_used"] == "spec"
+        assert body["fell_back"] is False
+
+    def test_the_spec_is_summarized_not_dumped(self, client, offline_refine):
+        """The whole point of the digest: a spec goes up as a short
+        description, so the prompt must not contain the bbox integers that the
+        raw JSON is mostly made of."""
+        spec = spec_dict()
+        response = client.post(
+            self.URL, data={"note": "표가 이상해", "spec": json.dumps(spec)}
+        )
+        assert response.status_code == 200
+
+        sent = str(offline_refine.calls[0]["messages"][1]["content"])
+        assert '"bbox"' not in sent
+        assert "coord" not in sent.lower()
+        # ...and it really did carry the slide, not just the note.
+        assert "element" in sent.lower()
+
+    def test_an_image_is_used_when_there_is_no_spec(
+        self, client, png_bytes, offline_refine
+    ):
+        response = client.post(
+            self.URL, data={"note": "표가 이상해"}, files=upload(png_bytes)
+        )
+
+        assert response.status_code == 200
+        assert response.json()["context_used"] == "image"
+        # One vision call, carrying the image as a data URL part.
+        content = offline_refine.calls[0]["messages"][1]["content"]
+        assert isinstance(content, list)
+        assert any(part.get("type") == "image_url" for part in content)
+
+    def test_a_bare_note_still_answers(self, client, offline_refine):
+        response = client.post(self.URL, data={"note": "표가 이상해"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["context_used"] == "none"
+        assert body["instruction"]
+
+    @pytest.mark.parametrize(
+        "note",
+        ["", "   ", "\t\n  \n", "　"],  # incl. an ideographic space
+        ids=["empty", "spaces", "newlines", "ideographic-space"],
+    )
+    def test_a_blank_note_is_empty_note(self, client, offline_refine, note):
+        response = client.post(self.URL, data={"note": note})
+
+        assert response.status_code == 400
+        assert envelope(response)["code"] == "empty_note"
+        # Nothing was sent upstream for a request that cannot be answered.
+        assert offline_refine.calls == []
+
+    def test_a_missing_note_field_is_also_empty_note(self, client, offline_refine):
+        """Not fastapi's own 422: the contract pins ONE code for "no note",
+        so the UI has one Korean sentence for it."""
+        response = client.post(self.URL, data={"spec": "{}"})
+
+        assert response.status_code == 400
+        assert envelope(response)["code"] == "empty_note"
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "}{ not json {{",
+            '{"elements":[{"type":"text"',  # truncated mid-object
+            "12345",
+            "null",
+            '{"elements":[]}',
+            '{"elements":"not a list"}',
+            "[]",
+        ],
+        ids=[
+            "garbage",
+            "truncated",
+            "bare-number",
+            "null",
+            "no-elements",
+            "elements-not-a-list",
+            "empty-array",
+        ],
+    )
+    def test_an_unusable_spec_is_ignored_not_rejected(
+        self, client, offline_refine, spec
+    ):
+        """A spec is only CONTEXT. An unreadable one degrades to the next
+        context down and SAYS so - it must never 500, and must never cost the
+        user their answer."""
+        response = client.post(self.URL, data={"note": "표가 이상해", "spec": spec})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["context_used"] == "none"
+        assert body["instruction"]
+
+    def test_an_unusable_spec_falls_back_to_the_image(
+        self, client, png_bytes, offline_refine
+    ):
+        """Cheapest-first, but not at the cost of context: when the spec
+        cannot be read and an image was sent, the image is used."""
+        response = client.post(
+            self.URL,
+            data={"note": "표가 이상해", "spec": "}{ not json {{"},
+            files=upload(png_bytes),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["context_used"] == "image"
+
+    def test_a_non_image_file_is_not_an_image(self, client, offline_refine):
+        """The optional context file goes through the same validation
+        ``/api/convert`` uses - it is not re-implemented, so it cannot drift."""
+        response = client.post(
+            self.URL,
+            data={"note": "표가 이상해"},
+            files={"file": ("slide.png", b"this is plain text", "image/png")},
+        )
+
+        assert response.status_code == 400
+        assert envelope(response)["code"] == "not_an_image"
+
+    def test_an_oversized_file_reuses_the_upload_cap(self, client, offline_refine):
+        oversized = b"A" * (converter.MAX_UPLOAD_BYTES + 1)
+        response = client.post(
+            self.URL,
+            data={"note": "표가 이상해"},
+            files={"file": ("slide.png", oversized, "image/png")},
+        )
+
+        assert response.status_code == 413
+        assert envelope(response)["code"] == "file_too_large"
+
+    def test_a_blank_note_beats_a_bad_file(self, client, offline_refine):
+        """Two things are wrong; the code names the one the caller actually
+        forgot. The note is required, the file is optional context."""
+        response = client.post(
+            self.URL,
+            data={"note": "   "},
+            files={"file": ("slide.png", b"not an image", "image/png")},
+        )
+
+        assert response.status_code == 400
+        assert envelope(response)["code"] == "empty_note"
+
+    def test_an_empty_file_part_means_no_file(self, client, offline_refine):
+        """A browser posting a form with an untouched ``<input type=file>``
+        still sends the part, with no bytes and no filename. That is "I have no
+        image yet", not ``empty_file`` - answering an error there would break
+        the assist for every user who has not picked a file."""
+        response = client.post(
+            self.URL, data={"note": "표가 이상해"}, files={"file": ("", b"", "")}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["context_used"] == "none"
+
+    def test_a_named_but_empty_file_is_still_empty_file(self, client, offline_refine):
+        """The other side of that boundary. A part with a FILENAME is someone
+        genuinely trying to send an image, so zero bytes is a real problem
+        worth naming - the "no file at all" path above is the one that must
+        stay silent."""
+        response = client.post(
+            self.URL,
+            data={"note": "표가 이상해"},
+            files={"file": ("slide.png", b"", "image/png")},
+        )
+
+        assert response.status_code == 400
+        assert envelope(response)["code"] == "empty_file"
+
+    def test_no_key_is_missing_api_key(self, client, monkeypatch):
+        """Checked before anything is encoded or sent: 503, by name, so the
+        operator learns which variable to set."""
+        monkeypatch.setattr(config, "LITELLM_API_KEY", "", raising=False)
+
+        def _bomb():  # pragma: no cover - a call is the failure
+            raise AssertionError("no client may be built without a key")
+
+        monkeypatch.setattr(config, "get_client", _bomb)
+
+        response = client.post(self.URL, data={"note": "표가 이상해"})
+
+        assert response.status_code == 503
+        assert envelope(response)["code"] == "missing_api_key"
+
+    def test_an_upstream_failure_is_refine_failed(self, client, monkeypatch, with_key):
+        fake = _FakeClient(reply=RuntimeError("upstream exploded"))
+        monkeypatch.setattr(config, "get_client", lambda: fake)
+
+        response = client.post(self.URL, data={"note": "표가 이상해"})
+
+        assert response.status_code == 502
+        assert envelope(response)["code"] == "refine_failed"
+
+    def test_build_failed_is_not_reachable_here(self, client, monkeypatch, with_key):
+        """Nothing is built on this path, so the contract deliberately leaves
+        ``build_failed`` out of it."""
+        fake = _FakeClient(reply=RuntimeError("upstream exploded"))
+        monkeypatch.setattr(config, "get_client", lambda: fake)
+
+        response = client.post(self.URL, data={"note": "표가 이상해"})
+        assert envelope(response)["code"] != "build_failed"
+
+    @pytest.mark.parametrize(
+        "reply",
+        ["", "   ", "```\n```", "...", None],
+        ids=["empty", "spaces", "empty-fence", "punctuation", "none"],
+    )
+    def test_a_useless_reply_never_empties_the_textarea(
+        self, client, monkeypatch, with_key, reply
+    ):
+        """The one thing this feature must not do. The frontend writes
+        ``instruction`` straight into the box the user typed in, so a 200 with
+        an empty instruction would delete their own words."""
+        fake = _FakeClient(reply=reply)
+        monkeypatch.setattr(config, "get_client", lambda: fake)
+
+        response = client.post(self.URL, data={"note": "표가 이상해"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["instruction"].strip()
+        # It is the note itself coming back, so the honest answer is "none":
+        # neither spec nor image informed it.
+        assert body["context_used"] == "none"
+
+    def test_a_fallback_does_not_claim_the_spec_was_used(
+        self, client, monkeypatch, with_key
+    ):
+        """A usable spec WAS sent, but the model gave nothing back, so the
+        answer is only the tidied note. Reporting ``spec`` here would make the
+        UI's "슬라이드 분석 결과를 참고했습니다" a lie."""
+        fake = _FakeClient(reply="")
+        monkeypatch.setattr(config, "get_client", lambda: fake)
+
+        response = client.post(
+            self.URL,
+            data={"note": "표가 이상해", "spec": json.dumps(spec_dict())},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["context_used"] == "none"
+
+    def test_the_model_field_defaults_and_overrides(self, client, offline_refine):
+        """Same as ``/api/convert``: absent means the server's configured
+        model, present means exactly what was asked for."""
+        client.post(self.URL, data={"note": "표가 이상해"})
+        assert offline_refine.calls[0]["model"] == config.DEFAULT_MODEL
+
+        client.post(self.URL, data={"note": "표가 이상해", "model": "other-model"})
+        assert offline_refine.calls[1]["model"] == "other-model"
+
+    def test_the_endpoint_is_in_the_schema_with_its_fields(self, client):
+        schema = client.get("/openapi.json").json()
+        post = schema["paths"]["/api/refine-instructions"]["post"]
+        ref = post["requestBody"]["content"]["multipart/form-data"]["schema"]["$ref"]
+        fields = schema["components"]["schemas"][ref.rsplit("/", 1)[-1]]["properties"]
+
+        assert set(fields) >= {"note", "spec", "file", "model"}
+
+    def test_the_instruction_is_length_capped(self, client, monkeypatch, with_key):
+        """An ``extra_instructions`` value longer than the analyzer's own
+        prompt stops being guidance, and it has to fit a textarea a human can
+        still read."""
+        fake = _FakeClient(reply="가" * 5000)
+        monkeypatch.setattr(config, "get_client", lambda: fake)
+
+        response = client.post(self.URL, data={"note": "표가 이상해"})
+
+        assert response.status_code == 200
+        assert len(response.json()["instruction"]) <= 600
 
 
 # =========================================================================== #
@@ -1564,6 +1956,7 @@ class TestAppWiring:
         assert paths == {
             "/api/health",
             "/api/convert",
+            "/api/refine-instructions",
             "/api/preview",
             "/api/build-from-json",
             "/api/download/{file_id}",

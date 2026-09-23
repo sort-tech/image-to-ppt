@@ -317,6 +317,8 @@ def index() -> dict[str, Any]:
         "endpoints": [
             "GET  /api/health",
             "POST /api/convert",
+            "POST /api/refine-instructions",
+            "POST /api/preview",
             "POST /api/build-from-json",
             "GET  /api/download/{file_id}",
         ],

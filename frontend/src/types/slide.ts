@@ -268,6 +268,52 @@ export interface PreviewResponse {
   preview: SlidePreview | null;
 }
 
+/**
+ * Which context the instruction assist actually had to work with.
+ *
+ * `"spec"` is the summarized SlideSpec of the last conversion, `"image"` the
+ * source image when no conversion has happened yet, `"none"` neither - the note
+ * was only tidied. The UI reports this verbatim rather than guessing from what
+ * it sent, so it cannot claim the slide was taken into account when it was not.
+ */
+export type RefineContext = "spec" | "image" | "none";
+
+/** `POST /api/refine-instructions` -> 200 */
+export interface RefineResponse {
+  status: "success";
+  /** The completed instruction, ready to drop into `extra_instructions`. */
+  instruction: string;
+  /** The note exactly as it was received. */
+  note: string;
+  context_used: RefineContext;
+  /**
+   * The model returned nothing usable, so `instruction` is the user's own note,
+   * tidied - not a completion.
+   *
+   * It sits beside `context_used` because that field alone cannot tell this
+   * apart from a genuine no-context run: both answer `"none"`, and the two need
+   * different sentences on screen. A fallback happens *after* a digest has been
+   * built and sent, so blaming a missing context for it would state a reason
+   * that did not happen.
+   */
+  fell_back: boolean;
+}
+
+/**
+ * What the last completed assist did, as the panel has to describe it.
+ *
+ * Three independent facts, because one sentence has to be true about all of
+ * them: which context the SERVER reported using, whether the model actually
+ * completed anything, and whether the text in the box really changed (a
+ * fallback that only collapsed whitespace did change it; one that returned the
+ * note verbatim did not, and then there is nothing for 되돌리기 to restore).
+ */
+export interface RefineOutcome {
+  context: RefineContext;
+  fellBack: boolean;
+  changed: boolean;
+}
+
 /** `GET /api/health` -> 200. Reports configuration only; it never fails. */
 export interface HealthResponse {
   status: string;
@@ -299,6 +345,10 @@ export type ApiErrorCode =
   | "proxy_unreachable"
   | "analysis_failed"
   | "build_failed"
+  /** `POST /api/refine-instructions`: the note was blank after trimming. */
+  | "empty_note"
+  /** `POST /api/refine-instructions`: the model gave nothing usable back. */
+  | "refine_failed"
   | "invalid_spec"
   | "unknown_download"
   | "internal_error"
@@ -338,12 +388,45 @@ export interface ApiErrorEnvelope {
 /* Request inputs                                                             */
 /* -------------------------------------------------------------------------- */
 
-/** Multipart fields for `POST /api/convert`. */
+/**
+ * Multipart fields for `POST /api/convert`.
+ *
+ * There is deliberately **no `model`** here.
+ *
+ * The endpoint still accepts a `model` field - API clients and the CLI's `-m`
+ * need it - but this UI has no picker and never sends one, so the model in use
+ * is whatever the server is configured with (`VISION_MODEL`), reported in the
+ * header status pill. Carrying an optional `model` on this type anyway would
+ * make it a knob that type-checks, reads as supported, and silently does
+ * nothing; leaving it out means the compiler rejects the mistake at the call
+ * site instead. Restore it only together with a `body.append("model", ...)` in
+ * {@link ../api/client.convert}.
+ */
 export interface ConvertInput {
   file: File;
-  /** Blank/absent lets the server pick its default model. */
-  model?: string;
   extra_instructions?: string;
+}
+
+/**
+ * Multipart fields for `POST /api/refine-instructions`.
+ *
+ * `spec` and `file` are both context, and the server prefers `spec` when it is
+ * usable, so the caller sends whichever one it has - the spec of the last
+ * conversion, or the selected image before there is one. Neither is required:
+ * with no context the note is only tidied.
+ *
+ * `spec` is `unknown` rather than {@link SlideSpec} for the same reason the
+ * spec editor passes its buffer through untouched - what is on screen may be
+ * hand-edited JSON - and because the server parses it leniently and ignores
+ * anything it cannot read.
+ */
+export interface RefineInput {
+  /** The user's rough note, in any language. Required. */
+  note: string;
+  /** The spec the current preview was built from, when there is one. */
+  spec?: unknown;
+  /** The source image, used when no conversion has happened yet. */
+  file?: File | null;
 }
 
 /** What `buildFromJson` hands back: the deck plus its sidecar headers. */

@@ -20,6 +20,7 @@ import {
   downloadResult,
   getHealth,
   previewSpec,
+  refineInstructions,
   saveBlob,
   toApiError,
 } from "./api/client";
@@ -33,6 +34,7 @@ import type {
   ConvertResponse,
   ElementCounts,
   HealthResponse,
+  RefineOutcome,
   SlidePreview,
 } from "./types/slide";
 
@@ -90,8 +92,21 @@ export default function App() {
   const [healthLoading, setHealthLoading] = useState(true);
 
   const [file, setFile] = useState<File | null>(null);
-  const [model, setModel] = useState("");
   const [extraInstructions, setExtraInstructions] = useState("");
+
+  /**
+   * The instruction assist: whether it is running, what the last one did, and
+   * the text it replaced.
+   *
+   * `preRefineNote` is the user's own writing, kept verbatim so 되돌리기 can put
+   * exactly that back. It is dropped the moment they type again, because from
+   * then on their newer text is what an undo would throw away - and it is never
+   * set when the assist did not actually change the box, because an undo that
+   * restores identical text is a button that claims to do something.
+   */
+  const [refining, setRefining] = useState(false);
+  const [refineOutcome, setRefineOutcome] = useState<RefineOutcome | null>(null);
+  const [preRefineNote, setPreRefineNote] = useState<string | null>(null);
 
   const [converting, setConverting] = useState(false);
   const [progress, setProgress] = useState<string>(PROGRESS[0] ?? WORKING);
@@ -107,6 +122,42 @@ export default function App() {
 
   /** Belt-and-braces double-submit guard: state updates are async. */
   const inFlight = useRef(false);
+
+  /** The same guard for the assist, plus the handle that cancels a stale one. */
+  const refineInFlight = useRef(false);
+  const refineAbort = useRef<AbortController | null>(null);
+
+  // A reply that lands after the page is gone has nowhere to go.
+  useEffect(() => () => refineAbort.current?.abort(), []);
+
+  /**
+   * Cancels an assist in flight.
+   *
+   * Called from EVERY path that changes what the assist was asked about - the
+   * note itself, the undo, the image, the spec on screen - because a reply is
+   * only meaningful for the note and the context it was sent with. Leaving one
+   * running was not harmless: the undo path restored the user's sentence and
+   * then the earlier reply landed on top of it, taking that sentence out of
+   * state entirely, and a file swap left "선택한 이미지를 참고해 완성했습니다"
+   * next to a different image, or to none at all.
+   */
+  const cancelRefine = useCallback(() => {
+    refineAbort.current?.abort();
+  }, []);
+
+  /**
+   * What is in the instructions box right now.
+   *
+   * A reply arrives in its own task, long after the closure that started it was
+   * created, so `extraInstructions` captured there says what the box held when
+   * the request went out - not what it holds now. This ref is the second half of
+   * the guard: even if an abort is ever missed, a reply whose rough note is no
+   * longer in the box is dropped instead of overwriting whatever replaced it.
+   */
+  const noteRef = useRef(extraInstructions);
+  useEffect(() => {
+    noteRef.current = extraInstructions;
+  }, [extraInstructions]);
 
   /* ----------------------------------------------------------------------- */
   /* Health                                                                  */
@@ -177,6 +228,22 @@ export default function App() {
     };
   }, [edited, result]);
 
+  /**
+   * The spec the slide currently on screen was built from, or null before the
+   * first conversion.
+   *
+   * `edited.payload` wins when an edited preview is showing: that is the slide
+   * the user is looking at and the one their "이 부분을 고치고 싶은데" refers to,
+   * so it is the context the assist has to reason about. Unlike {@link view} it
+   * is deliberately `unknown` - a hand-edited buffer may legitimately be a bare
+   * element array or a `{"spec": ...}` wrapper, and the assist endpoint parses
+   * it leniently.
+   */
+  const currentSpec = useMemo<unknown>(
+    () => (edited ? edited.payload : (result?.spec ?? null)),
+    [edited, result],
+  );
+
   /* ----------------------------------------------------------------------- */
   /* Actions                                                                 */
   /* ----------------------------------------------------------------------- */
@@ -196,11 +263,17 @@ export default function App() {
     setResult(null);
     setEdited(null);
     setTab("result");
+    // The spec on screen is the assist's context, and this replaces it. (The
+    // button is disabled while an assist runs, so this is the belt to that
+    // braces - but the assist's honesty must not depend on a `disabled` prop.)
+    setRefineOutcome(null);
+    cancelRefine();
 
     try {
+      // No `model`: the Vision model is whatever the backend is configured
+      // with, and the header pill is where that is reported.
       const data = await convert({
         file,
-        model,
         extra_instructions: extraInstructions,
       });
       setResult(data);
@@ -211,7 +284,115 @@ export default function App() {
       inFlight.current = false;
       setConverting(false);
     }
-  }, [extraInstructions, file, model]);
+  }, [cancelRefine, extraInstructions, file]);
+
+  /* ----------------------------------------------------------------------- */
+  /* The instruction assist                                                  */
+  /* ----------------------------------------------------------------------- */
+
+  /**
+   * Completes the rough note in the instructions box, in place.
+   *
+   * Context is whichever the UI has: the spec of the slide on screen when a
+   * conversion has happened (text-only, and the whole reason this is worth a
+   * round trip), the selected image before that. The server decides what it can
+   * actually use and reports it in `context_used` + `fell_back`, and that pair
+   * - not what we sent - is what the panel describes.
+   *
+   * `refineInstructions` never resolves with a blank instruction - it raises
+   * `refine_failed` instead - so there is no path here that empties the
+   * textarea. A failure leaves the note exactly as typed and only shows the
+   * error banner.
+   */
+  const handleRefine = useCallback(async () => {
+    if (refineInFlight.current || refining) return;
+    // `rough`, not `note`: `note` is the panel's own status line, and the two
+    // sitting in one function is exactly how the wrong one gets cleared.
+    const rough = extraInstructions;
+    if (!rough.trim()) return;
+
+    cancelRefine();
+    const controller = new AbortController();
+    refineAbort.current = controller;
+    refineInFlight.current = true;
+    setRefining(true);
+    setError(null);
+    setNote(null);
+    // The previous run's line described the previous text.
+    setRefineOutcome(null);
+
+    try {
+      const data = await refineInstructions(
+        currentSpec !== null
+          ? { note: rough, spec: currentSpec }
+          : { note: rough, file },
+        controller.signal,
+      );
+      // Aborted between the response arriving and this line: the user has
+      // typed since, so this reply completes text that is no longer there.
+      if (controller.signal.aborted) return;
+      // ...and the same test on the text itself, for any path that changed the
+      // box without going through an abort. Dropping a reply costs one wasted
+      // call; landing a stale one costs the user their own sentence.
+      if (noteRef.current !== rough) return;
+
+      const changed = data.instruction !== rough;
+      // Only offer the undo when there is really something to undo. A fallback
+      // can hand back the note verbatim, and a 되돌리기 that restores identical
+      // text is a button that claims to do something.
+      setPreRefineNote(changed ? rough : null);
+      setExtraInstructions(data.instruction);
+      setRefineOutcome({
+        context: data.context_used,
+        fellBack: data.fell_back,
+        changed,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      setError(toApiError(err).toDetail());
+    } finally {
+      refineInFlight.current = false;
+      if (refineAbort.current === controller) refineAbort.current = null;
+      setRefining(false);
+    }
+  }, [cancelRefine, currentSpec, extraInstructions, file, refining]);
+
+  /**
+   * Every keystroke in the instructions box - and the point where an assist
+   * stops applying.
+   *
+   * The undo is dropped because it would now discard the user's newer text; the
+   * context line goes because it no longer describes what is in the box; and a
+   * reply still in flight is cancelled rather than allowed to land on top of
+   * what is being typed.
+   */
+  const changeExtraInstructions = useCallback(
+    (value: string) => {
+      setExtraInstructions(value);
+      setPreRefineNote(null);
+      setRefineOutcome(null);
+      cancelRefine();
+    },
+    [cancelRefine],
+  );
+
+  /**
+   * Restores the pre-assist text, character for character.
+   *
+   * This cancels a run in flight for exactly the reason typing does: clicking
+   * 되돌리기 IS an edit of the box, and it is the edit that says "I want my own
+   * sentence back". Without the abort, a reply started on the machine text
+   * landed on top of the restored note a few seconds later - the user's
+   * sentence was then gone from state as well as from the box, and 되돌리기
+   * restored the machine text instead of it.
+   */
+  const handleUndoRefine = useCallback(() => {
+    if (preRefineNote === null) return;
+    cancelRefine();
+    setExtraInstructions(preRefineNote);
+    setPreRefineNote(null);
+    setRefineOutcome(null);
+  }, [cancelRefine, preRefineNote]);
 
   /**
    * The result panel's download.
@@ -266,6 +447,11 @@ export default function App() {
       setRefreshing(true);
       setError(null);
       setNote(null);
+      // This is the other way the assist's context changes: the slide on screen
+      // becomes the edited spec, so a reply about the previous one would be
+      // described as "현재 화면의 슬라이드 분석 결과" when it is not.
+      setRefineOutcome(null);
+      cancelRefine();
       try {
         const data = await previewSpec(payload);
         setEdited({
@@ -285,24 +471,43 @@ export default function App() {
         setRefreshing(false);
       }
     },
-    [refreshing],
+    [cancelRefine, refreshing],
   );
 
   /** Reverting the editor puts the originally converted slide back on screen. */
   const handleRevert = useCallback(() => {
     setEdited(null);
     setNote(null);
-  }, []);
+    // Same reason as the refresh: the spec on screen - the assist's context -
+    // is what changes here.
+    setRefineOutcome(null);
+    cancelRefine();
+  }, [cancelRefine]);
 
   /** A different image makes the shown result stale too, so it goes as well. */
-  const chooseFile = useCallback((next: File | null) => {
-    setFile(next);
-    setResult(null);
-    setEdited(null);
-    setNote(null);
-  }, []);
+  const chooseFile = useCallback(
+    (next: File | null) => {
+      setFile(next);
+      setResult(null);
+      setEdited(null);
+      setNote(null);
+      // "선택한 이미지를 참고해 완성했습니다" would be a claim about the previous
+      // image. The completed text itself stays - it is the user's to keep or
+      // undo. And an assist still in flight is cancelled, not just unlabelled:
+      // its reply would set that very line again, next to the new image or - if
+      // the file was cleared - next to no image at all, while the instruction it
+      // carries describes the slide that is no longer on screen.
+      setRefineOutcome(null);
+      cancelRefine();
+    },
+    [cancelRefine],
+  );
 
-  const disabledReason = !file ? "먼저 이미지를 선택해 주세요" : null;
+  const disabledReason = !file
+    ? "먼저 이미지를 선택해 주세요"
+    : refining
+      ? "문장 완성이 끝나면 변환할 수 있습니다"
+      : null;
   const busy = converting || inFlight.current;
 
   /* ----------------------------------------------------------------------- */
@@ -350,11 +555,13 @@ export default function App() {
             />
 
             <OptionPanel
-              model={model}
-              onModelChange={setModel}
               extraInstructions={extraInstructions}
-              onExtraInstructionsChange={setExtraInstructions}
-              modelPlaceholder={health?.proxy.model ?? "gemini-flash"}
+              onExtraInstructionsChange={changeExtraInstructions}
+              onRefine={() => void handleRefine()}
+              refining={refining}
+              refineOutcome={refineOutcome}
+              onUndoRefine={handleUndoRefine}
+              canUndoRefine={preRefineNote !== null}
               keyMissing={keyMissing}
               disabled={busy}
             />
@@ -363,7 +570,11 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => void handleConvert()}
-                disabled={busy || !file}
+                // `refining` too: the assist is about to replace the contents
+                // of the instructions box, and converting with the text it is
+                // replacing would send the version the user just asked to have
+                // rewritten.
+                disabled={busy || refining || !file}
                 title={disabledReason ?? undefined}
                 aria-describedby="convert-status"
                 className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-sky-500 px-6 py-4 text-base font-semibold text-sky-950 shadow-lg shadow-sky-500/25 transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none"
@@ -468,6 +679,21 @@ export default function App() {
 /* Header status pill                                                         */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Backend readiness, and the Vision model actually in use.
+ *
+ * Since there is no model control on screen, this pill is the only place the
+ * configured model is reported - so it is a readout of `/api/health`, never a
+ * suggestion that it can be changed from here. The tooltip spells out what the
+ * mono text is, which the removed field's label used to do.
+ *
+ * A blank `proxy.model` is named as blank rather than interpolated: the pill
+ * used to render " · 키 설정됨", a dangling separator where the model should be,
+ * which is the one thing this pill exists not to do. The backend's config now
+ * falls back to its documented default before this can happen, so this is the
+ * belt to that braces - and it says WHERE to set the name, since the screen no
+ * longer has a field for it.
+ */
 function StatusPill({
   loading,
   health,
@@ -482,6 +708,15 @@ function StatusPill({
   let headline = "백엔드 확인 중...";
   let detail: string | null = null;
 
+  const model = health?.proxy.model?.trim() ?? "";
+  /** The model's name, or Korean copy saying there isn't one. */
+  const modelText = model || "모델 이름 없음";
+  const tooltip = !loading && health
+    ? model
+      ? `백엔드에 설정된 Vision 모델: ${model}`
+      : "백엔드에 Vision 모델 이름이 없습니다. .env의 VISION_MODEL을 설정한 뒤 백엔드를 다시 시작해 주세요."
+    : undefined;
+
   if (!loading && error) {
     tone = "border-rose-500/40 bg-rose-500/10 text-rose-200";
     icon = <ServerCrash aria-hidden="true" className="h-3.5 w-3.5" />;
@@ -492,13 +727,13 @@ function StatusPill({
       tone = "border-emerald-500/40 bg-emerald-500/10 text-emerald-200";
       icon = <Zap aria-hidden="true" className="h-3.5 w-3.5" />;
       headline = "백엔드 준비 완료";
-      detail = `${health.proxy.model} · 키 설정됨`;
+      detail = `${modelText} · 키 설정됨`;
     } else {
       // With mock mode gone, the honest message is that a key is required.
       tone = "border-amber-500/40 bg-amber-500/10 text-amber-200";
       icon = <KeyRound aria-hidden="true" className="h-3.5 w-3.5" />;
       headline = "API 키 필요";
-      detail = `${health.proxy.model} · .env에 키를 설정해 주세요`;
+      detail = `${modelText} · .env에 키를 설정해 주세요`;
     }
   }
 
@@ -506,6 +741,7 @@ function StatusPill({
     <div
       role="status"
       aria-live="polite"
+      title={tooltip}
       className={`inline-flex shrink-0 items-center gap-2.5 self-start rounded-full border px-3.5 py-2 text-xs ${tone}`}
     >
       {icon}

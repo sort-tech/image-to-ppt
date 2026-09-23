@@ -16,6 +16,8 @@ import type {
   ElementCounts,
   HealthResponse,
   PreviewResponse,
+  RefineInput,
+  RefineResponse,
 } from "../types/slide";
 
 const API_BASE: string = (import.meta.env.VITE_API_BASE ?? "/api").replace(/\/+$/, "");
@@ -83,9 +85,26 @@ const ERROR_COPY: Record<string, ErrorCopy> = {
     message: "Vision 모델 프록시에 연결할 수 없습니다.",
     hint: "LiteLLM 프록시(기본 http://localhost:4000)가 실행 중인지 확인한 뒤 다시 시도해 주세요.",
   },
+  // One code, several causes: the model replied with something unusable, the
+  // key was rejected, or - the one this copy used to get wrong - the configured
+  // model does not exist on the proxy, in which case nothing replied at all.
+  // Telling that user to try a sharper image asserted a cause that did not
+  // happen and offered two remedies that cannot help, and since the UI no
+  // longer has a model field, the only remaining remedy is VISION_MODEL. So the
+  // message no longer claims the model answered, and the hint names the fix and
+  // points at the server's own detail below it, which says which case it was.
   analysis_failed: {
-    message: "Vision 모델이 이미지를 분석하지 못했습니다.",
-    hint: "모델 응답을 슬라이드 정보로 읽을 수 없었습니다. 더 선명한 이미지로 바꾸거나 추가 지시사항에 원하는 요소를 적어 다시 시도해 보세요.",
+    message: "Vision 모델 분석에 실패했습니다.",
+    hint: "모델을 호출하지 못했거나, 돌아온 응답을 슬라이드 정보로 읽을 수 없었습니다. 아래 상세 내용을 확인해 주세요. 모델 이름이 잘못된 경우에는 .env의 VISION_MODEL을 프록시가 제공하는 이름으로 바꾼 뒤 백엔드를 다시 시작해 주세요. 이미지 문제로 보이면 더 선명한 이미지로 바꾸거나 추가 지시사항에 원하는 요소를 적어 다시 시도해 보세요.",
+    keepServerDetail: true,
+  },
+  empty_note: {
+    message: "완성할 메모가 비어 있습니다.",
+    hint: "무엇을 바꾸고 싶은지 한 줄이라도 적어 주세요. 예: 표 글씨를 더 크게",
+  },
+  refine_failed: {
+    message: "지시사항 문장을 완성하지 못했습니다.",
+    hint: "모델이 쓸 수 있는 문장을 돌려주지 않았습니다. 적어 두신 메모는 그대로 남아 있으니, 조금 더 구체적으로 적은 뒤 다시 시도하거나 메모 그대로 변환해 주세요.",
     keepServerDetail: true,
   },
   build_failed: {
@@ -383,6 +402,11 @@ export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
  *
  * Optional fields are omitted when blank rather than sent empty, so the server
  * applies its own defaults.
+ *
+ * No `model` is sent, and {@link ConvertInput} has no field for one. The
+ * endpoint's `model` field is optional and falls back to the server's
+ * configured `DEFAULT_MODEL`, so omitting it is exactly what makes the
+ * configured model authoritative now that the UI has no picker for it.
  */
 export async function convert(
   input: ConvertInput,
@@ -390,9 +414,6 @@ export async function convert(
 ): Promise<ConvertResponse> {
   const body = new FormData();
   body.append("file", input.file, input.file.name);
-
-  const model = input.model?.trim();
-  if (model) body.append("model", model);
 
   const extra = input.extra_instructions?.trim();
   if (extra) body.append("extra_instructions", extra);
@@ -406,6 +427,82 @@ export async function convert(
   });
   if (!res.ok) throw await errorFromResponse(res);
   return readJson<ConvertResponse>(res);
+}
+
+/**
+ * `POST /api/refine-instructions` (multipart/form-data).
+ *
+ * Turns a rough note into one instruction written for the slide analyzer, in
+ * the note's own language. Context is optional and at most one is sent: the
+ * spec of the conversion on screen when there is one (text-only and cheap),
+ * otherwise the selected image. The server reports which it used in
+ * `context_used` and whether the model completed anything at all in
+ * `fell_back`, and those two together are what the UI describes - not what we
+ * hoped it would use.
+ *
+ * The note is sent as typed, not trimmed: the server trims it itself to decide
+ * whether it is blank, and echoes back what it received.
+ *
+ * This never resolves with a blank `instruction`. The caller drops the result
+ * straight into the user's textarea, so a 200 carrying nothing usable is a
+ * failure (`refine_failed`) and is raised as one - overwriting what the user
+ * typed with an empty string would destroy the very text this feature exists
+ * to improve.
+ */
+export async function refineInstructions(
+  input: RefineInput,
+  signal?: AbortSignal,
+): Promise<RefineResponse> {
+  const body = new FormData();
+  body.append("note", input.note);
+
+  // Only context, so a spec that cannot be serialized (a hand-edited buffer
+  // holding something exotic) is left out rather than failing the request.
+  if (input.spec !== undefined && input.spec !== null) {
+    try {
+      body.append("spec", JSON.stringify(input.spec));
+    } catch {
+      // Unserializable: fall through with no spec. The server then uses the
+      // file, or tidies the note, and says so in `context_used`.
+    }
+  } else if (input.file) {
+    body.append("file", input.file, input.file.name);
+  }
+
+  const res = await request("/refine-instructions", {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    body,
+    ...(signal ? { signal } : {}),
+  });
+  if (!res.ok) throw await errorFromResponse(res);
+
+  const data = await readJson<RefineResponse>(res);
+  const instruction = typeof data.instruction === "string" ? data.instruction.trim() : "";
+  if (!instruction) {
+    throw new ApiRequestError(
+      {
+        code: "refine_failed",
+        message: "서버가 완성된 지시사항을 돌려주지 않았습니다.",
+        hint: null,
+      },
+      res.status,
+    );
+  }
+
+  return {
+    status: "success",
+    instruction,
+    note: typeof data.note === "string" ? data.note : input.note,
+    // Passed through as sent. An unrecognized value is not mapped onto one of
+    // the three - the UI has copy per known value and simply says nothing for
+    // anything else, which is better than describing the wrong context.
+    context_used: data.context_used,
+    // Only a real `true` counts as a fallback. An older backend that does not
+    // send this field must not make the UI announce one: the honest default is
+    // "the model completed it", which is what `context_used` already describes.
+    fell_back: data.fell_back === true,
+  };
 }
 
 /**

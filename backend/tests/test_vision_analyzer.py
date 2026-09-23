@@ -150,6 +150,48 @@ class TestConfig:
         assert "OpenAI" not in globals_
         assert callable(config.get_client)
 
+    @pytest.mark.parametrize("blank", ["", "   ", "\t", "\n"])
+    def test_a_blank_env_value_falls_back_to_the_documented_default(
+        self, monkeypatch, blank
+    ):
+        """``VISION_MODEL=`` is PRESENT and empty, which is not "unset".
+
+        ``os.environ.get(name, default)`` falls back only when the variable is
+        missing, so a hand-edited ``.env`` line with nothing after the ``=``
+        made ``DEFAULT_MODEL`` the empty string - and ``env_file.load_env_file``
+        copies exactly that into the environment. Nothing downstream could
+        recover it: ``vision_analyzer``'s ``model or getattr(config,
+        "DEFAULT_MODEL", ...)`` keeps the empty string (the attribute exists),
+        the proxy answers "Invalid model name passed in model=" as a 502, and
+        ``/api/health`` reported an empty model, which the status pill - the only
+        place the model is named now that the UI has no picker - rendered as a
+        dangling " · 키 설정됨". A blank is not a configuration; it is the
+        absence of one, and configuration falls back rather than breaks.
+        """
+        monkeypatch.setenv("VISION_MODEL", blank)
+        monkeypatch.setenv("LITELLM_BASE_URL", blank)
+        try:
+            reloaded = importlib.reload(config)
+            assert reloaded.DEFAULT_MODEL == "gemini-flash"
+            assert reloaded.LITELLM_BASE_URL == "http://localhost:4000/"
+            # ...so the name the analyzer resolves an absent ``model`` to (see
+            # ``test_model_defaults_to_config``) and the one the header pill
+            # shows are both a real model rather than an empty string.
+            from app.services import converter
+
+            assert converter.health_payload()["proxy"]["model"] == "gemini-flash"
+        finally:
+            monkeypatch.undo()
+            importlib.reload(config)
+
+    def test_a_padded_env_value_is_used_without_its_padding(self, monkeypatch):
+        monkeypatch.setenv("VISION_MODEL", "  gpt-4o  ")
+        try:
+            assert importlib.reload(config).DEFAULT_MODEL == "gpt-4o"
+        finally:
+            monkeypatch.undo()
+            importlib.reload(config)
+
     def test_env_vars_override_the_defaults(self, monkeypatch):
         monkeypatch.setenv("VISION_MODEL", "some-other-model")
         monkeypatch.setenv("LITELLM_BASE_URL", "http://example.invalid:9999/")

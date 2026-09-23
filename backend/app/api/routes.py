@@ -10,10 +10,10 @@ Every error path raises ``HTTPException`` with a ``dict`` detail, which
 ``app.main``'s handler renders as the contract's one envelope:
 ``{"detail": {"code": ..., "message": ..., "hint": ...}}``.
 
-The two endpoints that do real work are ``async def`` because they read the
-request body themselves (``UploadFile.read``, ``Request.body``), but the
-pipeline they then call is fully BLOCKING: a vision call is ~10 s of network
-wait and ``python-pptx`` is CPU-bound. Calling it inline would run it ON THE
+The endpoints that do real work are ``async def`` because they read the request
+body themselves (``UploadFile.read``, ``Request.body``), but the pipeline they
+then call is fully BLOCKING: a vision call is ~10 s of network wait and
+``python-pptx`` is CPU-bound. Calling it inline would run it ON THE
 EVENT LOOP and stall every other request in the process for that whole time, so
 each blocking call is handed to the threadpool with
 :func:`starlette.concurrency.run_in_threadpool`. That is also the execution
@@ -28,7 +28,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-from ..services import converter
+from ..services import converter, instructions
 from ..services.converter import ConversionFailure
 
 __all__ = ["router", "http_error"]
@@ -192,6 +192,78 @@ async def convert(
             "filename": filename,
         }
     )
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/refine-instructions
+# --------------------------------------------------------------------------- #
+async def _optional_upload(file: UploadFile | None) -> tuple[bytes | None, str | None]:
+    """An OPTIONAL file part as ``(bytes, filename)``, or ``(None, None)``.
+
+    A browser that posts a form with an empty ``<input type="file">`` still
+    sends the part - zero bytes and an empty filename - so treating "the field
+    is present" as "a file was supplied" would answer ``empty_file`` to a user
+    who simply has no image yet. A part with neither bytes nor a name is
+    therefore read as "not supplied"; a part with either is a real upload and
+    goes through the same validation ``/api/convert`` uses.
+    """
+    if file is None:
+        return None, None
+    data = await _read_capped(file)
+    filename = file.filename
+    if not data and not (filename or "").strip():
+        return None, None
+    return data, filename
+
+
+@router.post("/refine-instructions", summary="Rough note -> analyzer instruction")
+async def refine_instructions(
+    note: str | None = Form(None, description="The user's rough note, any language"),
+    spec: str | None = Form(None, description="Current SlideSpec JSON, as context"),
+    file: UploadFile | None = File(None, description="Source image, used if no spec"),
+    model: str | None = Form(None, description="Vision model; defaults to the server's"),
+) -> JSONResponse:
+    """Complete a rough note into one instruction for the slide analyzer.
+
+    ``note`` is declared OPTIONAL here on purpose: a missing field would
+    otherwise leave as fastapi's own 422, and the contract pins a 400
+    ``empty_note`` for both "missing" and "blank after trim" - one code, one
+    Korean sentence in the UI. The blank check lives in
+    ``instructions.refine_instruction`` so the CLI would get it too.
+
+    Neither ``spec`` nor ``file`` is required, and a malformed ``spec`` is not
+    an error: both are only CONTEXT, so an unusable one degrades to the next
+    one down and the answer says which was used.
+    """
+    data, filename = await _optional_upload(file)
+
+    try:
+        # The required field first, before an optional context file can be
+        # rejected for its own reasons: a caller who sent no note gets the code
+        # that names the thing they actually forgot. The same check lives in
+        # ``refine_instruction`` for non-HTTP callers - one shared factory, so
+        # the two can never disagree about the envelope.
+        if not (note or "").strip():
+            raise instructions.empty_note_failure()
+
+        if data is not None:
+            # The 20 MB cap, the extension list and the real-image decode are
+            # converter's, exactly as for /api/convert - not re-implemented.
+            converter.validate_upload_bytes(data, filename)
+
+        # Off the event loop: this blocks for the length of the model call.
+        result = await run_in_threadpool(
+            instructions.refine_instruction,
+            note,
+            spec=spec,
+            image_bytes=data,
+            mime=instructions.mime_for_upload(filename),
+            model=_clean_text(model),
+        )
+    except ConversionFailure as failure:
+        raise _fail(failure) from None
+
+    return JSONResponse(content=result.payload())
 
 
 # --------------------------------------------------------------------------- #
