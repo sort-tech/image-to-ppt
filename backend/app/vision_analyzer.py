@@ -66,11 +66,13 @@ COORDINATE SYSTEM
 
 ELEMENT TYPES (use these exact type names and attribute names)
 
-1) Shape - a filled and/or outlined box, panel, band, divider or circle:
+1) Shape - a filled and/or outlined box, panel, band, divider, circle or BLOCK
+   arrow:
    {
      "type": "shape",
      "bbox": [x, y, w, h],
-     "kind": "rectangle" | "rounded_rectangle" | "circle",
+     "kind": "rectangle" | "rounded_rectangle" | "circle"
+             | "arrow_right" | "arrow_left" | "arrow_up" | "arrow_down",
      "fill_color": "#RRGGBB" or null,
      "border_color": "#RRGGBB" or null,
      "border_width": 1.0
@@ -78,6 +80,9 @@ ELEMENT TYPES (use these exact type names and attribute names)
    - "fill_color": null means no fill (transparent, content behind stays visible).
    - "border_color": null means no outline.
    - "border_width" is in points (typically 0.75 - 3.0).
+   - The "arrow_*" kinds are BLOCK arrows: a thick, filled arrow BODY you could
+     put a label inside, pointing right / left / up / down. A thin arrow that
+     merely joins two boxes is NOT a shape - it is a "connector" (type 4).
 
 2) Table - any grid of cells, ruled or unruled:
    {
@@ -141,6 +146,58 @@ ELEMENT TYPES (use these exact type names and attribute names)
      "bold": false out of caution; a bold title rendered as regular weight is a
      visible error. Set it false only for genuinely normal-weight text.
 
+4) Connector - a line or arrow that JOINS two things (a diagram arrow, a flow
+   line, a leader line, a bracket line):
+   {
+     "type": "connector",
+     "kind": "straight" | "elbow",
+     "start_point": [x, y],
+     "end_point": [x, y],
+     "arrow_start": false,
+     "arrow_end": true,
+     "dash_style": "solid" | "dashed",
+     "color": "#RRGGBB" or null,
+     "width_pt": 1.5
+   }
+   - A connector has NO "bbox". It IS its two endpoints, each [x, y] on the
+     same 0..1000 grid. Put each endpoint where the line visibly touches the
+     box it joins (on the box EDGE), not at the box centre.
+   - "kind": "straight" for a direct line; "elbow" for a line that turns a
+     right angle on its way, which is what most flow-chart arrows do when the
+     two boxes are offset on both axes.
+   - "arrow_start" / "arrow_end" say which END carries the arrowhead. A one-way
+     arrow pointing at the target is "arrow_start": false, "arrow_end": true;
+     reverse them for an arrow pointing back; set BOTH true for a
+     double-headed arrow; set BOTH false for a plain line with no arrowhead.
+   - "dash_style": "dashed" for a dashed or dotted line, otherwise "solid".
+   - "width_pt" is the line thickness in points (typically 1.0 - 3.0).
+   - Emit one connector per visible line. Do not draw connectors that are not
+     in the image just to tidy up a diagram.
+
+5) Image - a region you genuinely CANNOT rebuild with the types above:
+   {
+     "type": "image",
+     "bbox": [x, y, w, h],
+     "description": "team photo"
+   }
+   - Use it for a photograph, a rendered chart or graph whose numbers you
+     cannot transcribe, a logo, a map, a screenshot, an icon set or a detailed
+     illustration. That exact region is cropped out of the source image and
+     placed on the slide, so keep "bbox" TIGHT around the picture itself.
+   - "description" is a few words naming what the region shows. It is a label
+     for the preview, not a transcription, and it is never drawn on the slide.
+   - NEVER mark an ordinary box, panel, band, divider, text block, label,
+     heading or table as "image". Those must stay native and editable: that is
+     the entire purpose of this conversion. A chart drawn as coloured
+     rectangles is shapes; a grid of printed numbers is a table; anything you
+     can read is text.
+   - NEVER emit one "image" covering the whole slide (or most of it), and never
+     a few big "image" regions that together tile the slide. That flattens the
+     slide into a screenshot and destroys every editable object; such output is
+     rejected and the region is skipped.
+   - If you are unsure whether a region needs an "image", prefer rebuilding it
+     from shapes and text, and prefer leaving it out over covering the slide.
+
 COLOURS
 - Always "#RRGGBB" hex (6 digits, leading "#"). No colour names, no rgb(),
   no alpha. When a colour is absent or you are unsure, use null.
@@ -157,6 +214,10 @@ Z-ORDER RULE (critical)
   first, then text that sits on top of shapes).
 - Text and tables must come AFTER any shape they sit on, otherwise the shape
   covers them.
+- An "image" region goes with the layer it belongs to: a photo panel sitting
+  behind a caption comes BEFORE that caption.
+- Connectors come AFTER the boxes they join, so the arrow is not hidden under a
+  panel, but BEFORE the labels that sit on top of it.
 - Do NOT wrap the whole slide in one giant shape covering everything. The slide
   background belongs in "background_color", not in a full-bleed shape.
 
@@ -164,9 +225,13 @@ TRANSCRIPTION RULES
 - Transcribe visible text verbatim - VERBATIM means: same words, same capitalization, same
   punctuation, same numbers and units. Do not translate, correct, shorten or
   paraphrase. Keep natural reading order (top to bottom, left to right).
-- Omit purely decorative artifacts: photographs, logos, gradients, icons,
-  drop shadows and page furniture you cannot represent as a shape, table or
-  text box. Never emit an element that represents the whole image as a picture.
+- Omit purely decorative artifacts you cannot represent at all: gradients,
+  drop shadows, textures, glows and similar page furniture.
+- A photograph, logo, icon, map or un-transcribable chart is NOT omitted any
+  more - mark that region as an "image" element (type 5) so it is cropped out
+  of the source image. The limits in type 5 still hold: never an "image" for
+  something you could rebuild as a shape, table or text, and never one big
+  "image" standing in for the whole slide.
 - Prefer a HANDFUL OF ACCURATE elements over many speculative ones. If you
   cannot see something clearly, leave it out rather than guessing.
 
@@ -182,6 +247,13 @@ USER_PROMPT = (
     "tables, then text.\n"
     "Transcribe all visible text verbatim and keep every table as a row-major 2-D "
     "\"data\" array of strings with the header row first.\n"
+    "Emit every diagram line or arrow as a \"connector\" with \"start_point\" and "
+    "\"end_point\" (no bbox), saying which end carries the arrowhead and whether it "
+    "is dashed; use \"shape\" with \"kind\": \"arrow_right\" (or left/up/down) for a "
+    "thick block arrow.\n"
+    "Mark only a genuinely un-rebuildable region - a photo, a logo, an "
+    "un-transcribable chart - as an \"image\"; never an ordinary box, text or table, "
+    "and never one \"image\" covering the whole slide.\n"
     "Compute each \"font_size\" from the measured cap height, set \"bold\": true for "
     "visibly heavy text such as titles and headings, and make every text \"w\" wide "
     "enough (about 10% headroom) that the line cannot re-wrap.\n"

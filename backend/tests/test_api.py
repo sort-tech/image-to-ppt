@@ -23,6 +23,7 @@ touching the environment - and the fake is an obvious placeholder, because
 
 from __future__ import annotations
 
+import base64
 import copy
 import io
 import json
@@ -128,18 +129,32 @@ def open_deck(data: bytes) -> Presentation:
 
 
 def assert_native_deck(data: bytes) -> Presentation:
-    """python-pptx can open it, it is 16:9, and it contains no picture at all."""
+    """python-pptx can open it, it is 16:9, and it is NOT a flattened slide.
+
+    This used to assert "zero picture shapes", which stopped being the right
+    rule the moment a genuine photo / chart / logo region became a legitimate
+    ``image`` element. The replacement is ``pptx_builder.flattening_report`` -
+    THE definition of "flattened" for this project, so the tests and the build
+    itself read the same one. A second copy of the rule living here is exactly
+    how the two would drift and how a flattened deck would end up shipped past
+    whichever of them happened to be laxer.
+    """
     presentation = open_deck(data)
     assert len(presentation.slides) == 1
     assert round(presentation.slide_width.inches, 3) == 13.333
     assert round(presentation.slide_height.inches, 3) == 7.5
 
-    for shape in presentation.slides[0].shapes:
-        assert shape.shape_type != MSO_SHAPE_TYPE.PICTURE, "flattened picture found"
+    report = pptx_builder.flattening_report(presentation)
+    assert report["flattened"] is False, report
+    assert report["violations"] == [], report
 
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         names = archive.namelist()
-    assert not [name for name in names if name.startswith("ppt/media/")]
+    media = [name for name in names if name.startswith("ppt/media/")]
+    # Media is allowed now, but ONLY as much of it as there are pictures: a
+    # deck carrying image parts that no shape references would mean the crop
+    # went into the package without reaching the slide.
+    assert len(media) <= report["picture_count"]
     assert any(name.startswith("ppt/slides/slide") for name in names)
     return presentation
 
@@ -315,9 +330,12 @@ class TestConvertHappyPath:
             "text": 4,
         }
 
-    def test_the_returned_deck_is_native_with_zero_pictures(
+    def test_the_returned_deck_is_native_and_not_flattened(
         self, client, png_bytes, offline_convert
     ):
+        """The sample spec has no ``image`` element, so this deck really does
+        carry zero pictures - asserted here, on a spec where it is true, rather
+        than as a blanket rule (see ``assert_native_deck``)."""
         body = client.post("/api/convert", files=upload(png_bytes)).json()
         deck = client.get(f"/api/download/{body['download_id']}")
         assert deck.status_code == 200
@@ -329,6 +347,7 @@ class TestConvertHappyPath:
             MSO_SHAPE_TYPE.TABLE,
             MSO_SHAPE_TYPE.TEXT_BOX,
         }
+        assert pptx_builder.flattening_report(presentation)["picture_count"] == 0
 
     @pytest.mark.parametrize(
         ("uploaded", "expected"),
@@ -682,6 +701,289 @@ class TestConvertAnalyzed:
 
 
 # =========================================================================== #
+# POST /api/convert - connectors and cropped sub-images, end to end
+# =========================================================================== #
+#: The region ``DIAGRAM_SPEC``'s image element claims, in normalized units, and
+#: the colour painted into exactly that region of the uploaded image. A crop
+#: taken from anywhere else is not this colour, so the assertion does not have
+#: to trust the builder's arithmetic to check the pipeline's plumbing.
+IMAGE_REGION = (600, 200, 300, 400)
+IMAGE_RGB = (220, 40, 40)
+
+#: The uploaded image's own pixel size. Deliberately neither square nor the
+#: slide's 16:9, so mapping a bbox onto the wrong axis lands on white.
+UPLOAD_PX = (1000, 700)
+
+
+def diagram_png() -> bytes:
+    """A PNG whose :data:`IMAGE_REGION` is solid :data:`IMAGE_RGB`, else white."""
+    from PIL import Image
+
+    width, height = UPLOAD_PX
+    image = Image.new("RGB", UPLOAD_PX, (255, 255, 255))
+    x, y, w, h = IMAGE_REGION
+    box = (
+        round(x / config.COORD_SCALE * width),
+        round(y / config.COORD_SCALE * height),
+        round((x + w) / config.COORD_SCALE * width),
+        round((y + h) / config.COORD_SCALE * height),
+    )
+    image.paste(Image.new("RGB", (box[2] - box[0], box[3] - box[1]), IMAGE_RGB), box[:2])
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+#: An architecture-diagram spec: two boxes, a labelled arrow between them, a
+#: dashed elbow, a block arrow, and one photo region the analyzer could not
+#: express natively. This is the shape of payload the whole feature exists for.
+DIAGRAM_SPEC: dict = {
+    "background_color": "#FFFFFF",
+    "elements": [
+        {"type": "shape", "kind": "rectangle", "bbox": [50, 250, 200, 100],
+         "fill_color": "#E8EEF7"},
+        {"type": "shape", "kind": "rectangle", "bbox": [480, 250, 200, 100],
+         "fill_color": "#E8EEF7"},
+        {"type": "shape", "kind": "arrow_right", "bbox": [300, 270, 120, 60],
+         "fill_color": "#1E3A6E"},
+        {"type": "connector", "kind": "straight",
+         "start_point": [125, 300], "end_point": [480, 300],
+         "arrow_start": False, "arrow_end": True,
+         "dash_style": "solid", "color": "#1E3A6E", "width_pt": 1.5},
+        {"type": "connector", "kind": "elbow",
+         "start_point": [600, 100], "end_point": [900, 600],
+         "dash_style": "dashed"},
+        {"type": "image", "bbox": list(IMAGE_REGION), "description": "팀 사진"},
+        {"type": "text", "bbox": [50, 50, 400, 80], "content": "구성도"},
+    ],
+}
+
+
+def diagram_preview(client, image: bytes, monkeypatch) -> dict:
+    """Run ``/api/convert`` on ``image`` with a spec containing both new kinds."""
+    monkeypatch.setattr(
+        vision_analyzer,
+        "analyze_image",
+        fake_analyzer(SlideSpec.model_validate(copy.deepcopy(DIAGRAM_SPEC))),
+    )
+    response = client.post("/api/convert", files=upload(image, "diagram.png"))
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+class TestConvertDrawsConnectorsAndCropsSubImages:
+    """The end-to-end proof that the uploaded BYTES reach the builder.
+
+    ``/api/convert`` is the only entry point that holds the source image, so it
+    is the only one that can crop an ``image`` element. If the bytes were not
+    threaded through, this whole class fails with the element skipped and a
+    "no source image" warning - which is exactly the failure mode the
+    ``/api/preview`` tests assert on purpose.
+    """
+
+    @pytest.fixture
+    def body(self, client, monkeypatch, with_key, no_client_allowed) -> dict:
+        return diagram_preview(client, diagram_png(), monkeypatch)
+
+    def test_the_deck_carries_a_native_connector_and_a_real_picture(
+        self, client, body
+    ):
+        deck = client.get(f"/api/download/{body['download_id']}")
+        assert deck.status_code == 200
+        presentation = open_deck(deck.content)
+        types_seen = [shape.shape_type for shape in presentation.slides[0].shapes]
+
+        # LINE, not CONNECTOR: python-pptx 1.0.2 has no CONNECTOR member, so a
+        # test looking for one would pass by never matching anything.
+        assert types_seen.count(MSO_SHAPE_TYPE.LINE) == 2
+        assert types_seen.count(MSO_SHAPE_TYPE.PICTURE) == 1
+        assert MSO_SHAPE_TYPE.AUTO_SHAPE in types_seen
+        assert MSO_SHAPE_TYPE.TEXT_BOX in types_seen
+
+    def test_the_deck_is_not_flattened_even_though_it_holds_a_picture(
+        self, client, body
+    ):
+        deck = client.get(f"/api/download/{body['download_id']}")
+        presentation = assert_native_deck(deck.content)
+        report = pptx_builder.flattening_report(presentation)
+
+        assert report["picture_count"] == 1
+        assert report["flattened"] is False
+        # 30% x 40% of the slide, well inside the area limit.
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(12.0, abs=0.5)
+
+    def test_the_preview_reports_both_new_kinds_in_z_order(self, body):
+        kinds = [shape["kind"] for shape in body["preview"]["shapes"]]
+        assert kinds == [
+            "shape",
+            "shape",
+            "shape",
+            "connector",
+            "connector",
+            "image",
+            "text",
+        ]
+
+    def test_the_connector_payload_is_the_pinned_contract(self, body):
+        connector = body["preview"]["shapes"][3]
+        assert connector == {
+            "kind": "connector",
+            "start_pct": {"x": 12.5, "y": 30.0},
+            "end_pct": {"x": 48.0, "y": 30.0},
+            "elbow": False,
+            "arrow_start": False,
+            "arrow_end": True,
+            "dash": "solid",
+            "color": "#1E3A6E",
+            "width_pt": 1.5,
+        }
+
+    def test_the_elbow_connector_is_reported_as_dashed_and_bent(self, body):
+        elbow = body["preview"]["shapes"][4]
+        assert elbow["elbow"] is True
+        assert elbow["dash"] == "dashed"
+        assert elbow["start_pct"] == {"x": 60.0, "y": 10.0}
+        assert elbow["end_pct"] == {"x": 90.0, "y": 60.0}
+
+    def test_the_image_payload_carries_the_crop_and_its_geometry(self, body):
+        image = body["preview"]["shapes"][5]
+        assert image["kind"] == "image"
+        assert image["left_pct"] == 60.0
+        assert image["top_pct"] == 20.0
+        assert image["width_pct"] == 30.0
+        assert image["height_pct"] == 40.0
+        assert image["data_uri"], "the conversion had the source image; it must crop"
+        assert image["data_uri"].startswith("data:image/")
+        assert len(image["data_uri"]) <= 96 * 1024
+
+    def test_the_crop_came_from_the_right_region_of_the_upload(self, body):
+        """The plumbing test with teeth: only the claimed region of the upload
+        is red, so a crop that came from the wrong place - or from a blank
+        image - is white, and a crop that never happened is ``null``."""
+        from PIL import Image
+
+        data_uri = body["preview"]["shapes"][5]["data_uri"]
+        raw = base64.b64decode(data_uri.partition(",")[2])
+        crop = Image.open(io.BytesIO(raw)).convert("RGB")
+
+        for point in ((0, 0), (crop.width - 1, crop.height - 1)):
+            for channel, expected in zip(crop.getpixel(point), IMAGE_RGB):
+                assert abs(channel - expected) <= 8, (point, crop.getpixel(point))
+
+    def test_nothing_was_dropped_and_the_counts_name_the_new_types(self, body):
+        assert body["dropped"] == []
+        assert body["counts"]["connector"] == 2
+        assert body["counts"]["image"] == 1
+        assert body["counts"]["shape"] == 3
+        assert body["counts"]["text"] == 1
+        assert body["total"] == 7
+
+    def test_no_warning_claims_a_missing_source_image(self, body):
+        """The honesty rule: the conversion HAD the image, so nothing may say
+        it did not."""
+        assert not [
+            line for line in body["warnings"] if "no source image" in line
+        ], body["warnings"]
+
+    def test_the_spec_round_trips_with_both_new_element_types(self, body):
+        """What the UI posts back to /api/preview has to validate again."""
+        spec = SlideSpec.model_validate(body["spec"])
+        assert spec.counts_by_type()["connector"] == 2
+        assert spec.counts_by_type()["image"] == 1
+
+    def test_a_dropped_crop_is_reported_in_the_responses_warnings(
+        self, client, monkeypatch, with_key, no_client_allowed
+    ):
+        """``preview.py`` gives a crop up on stderr, like every other non-fatal
+        problem in this project; ``warning_lines`` is what turns that into the
+        response's ``warnings`` array. This asserts the whole plumbing, because
+        a ``data_uri`` that silently went ``null`` would leave the panel with an
+        unexplained placeholder - and the house rule is that the user is told.
+        """
+        monkeypatch.setattr(
+            converter.preview_module, "PREVIEW_IMAGE_MAX_URI_BYTES", 64
+        )
+        body = diagram_preview(client, diagram_png(), monkeypatch)
+
+        assert body["preview"]["shapes"][5]["data_uri"] is None
+        lines = [line for line in body["warnings"] if "too large" in line]
+        assert lines, body["warnings"]
+        # The module prefix is stripped, like [pptx_builder] and [vision_analyzer].
+        assert not any(line.startswith("[") for line in body["warnings"])
+        # ...and the deck the user downloads still carries the real crop.
+        deck = client.get(f"/api/download/{body['download_id']}")
+        presentation = open_deck(deck.content)
+        assert pptx_builder.flattening_report(presentation)["picture_count"] == 1
+
+
+class TestConvertAndPreviewAgree:
+    """One code path, asserted rather than assumed.
+
+    Both endpoints build the deck with ``converter.build_deck`` and describe it
+    with ``preview.build_preview``; the only difference is the source image. So
+    for a spec with NO image element the two previews must be byte-identical -
+    if they ever diverge, one of them grew its own derivation.
+    """
+
+    #: The diagram spec minus its image element: connectors and block arrows
+    #: need no source image, so both endpoints can render all of it.
+    @staticmethod
+    def spec_without_images() -> dict:
+        payload = copy.deepcopy(DIAGRAM_SPEC)
+        payload["elements"] = [
+            element for element in payload["elements"] if element["type"] != "image"
+        ]
+        return payload
+
+    def test_the_two_previews_are_identical(
+        self, client, monkeypatch, with_key, no_client_allowed
+    ):
+        payload = self.spec_without_images()
+        monkeypatch.setattr(
+            vision_analyzer,
+            "analyze_image",
+            fake_analyzer(SlideSpec.model_validate(copy.deepcopy(payload))),
+        )
+        converted = client.post(
+            "/api/convert", files=upload(diagram_png(), "diagram.png")
+        ).json()
+        assert converted["preview"] is not None
+
+        # Exactly what the UI does: post the spec it was handed back.
+        previewed = client.post("/api/preview", json=converted["spec"]).json()
+
+        assert previewed["preview"] == converted["preview"]
+        assert previewed["counts"] == converted["counts"]
+        assert previewed["warnings"] == converted["warnings"] == []
+
+    def test_a_spec_with_an_image_diverges_only_in_that_element(
+        self, client, monkeypatch, with_key, no_client_allowed
+    ):
+        """With an image element the two CANNOT agree - /api/preview has no
+        source image - and the difference has to be confined to that element
+        plus its warning, not smeared across the rest of the slide."""
+        converted = diagram_preview(client, diagram_png(), monkeypatch)
+        previewed = client.post("/api/preview", json=converted["spec"]).json()
+
+        converted_kinds = [s["kind"] for s in converted["preview"]["shapes"]]
+        previewed_kinds = [s["kind"] for s in previewed["preview"]["shapes"]]
+        assert converted_kinds[5] == "image"
+        assert previewed_kinds[5] == "shape", "the placeholder outline"
+        assert converted_kinds[:5] == previewed_kinds[:5]
+        assert converted_kinds[6:] == previewed_kinds[6:]
+
+        # Every other entry is identical, element for element.
+        for index in [0, 1, 2, 3, 4, 6]:
+            assert (
+                converted["preview"]["shapes"][index]
+                == previewed["preview"]["shapes"][index]
+            ), index
+
+        assert converted["warnings"] == []
+        assert any("no source image" in line for line in previewed["warnings"])
+
+
+# =========================================================================== #
 # POST /api/convert - every error code
 # =========================================================================== #
 class TestConvertErrors:
@@ -850,7 +1152,10 @@ class TestConvertErrors:
         assert envelope(response)["code"] == "missing_api_key"
 
     def test_build_failed(self, client, png_bytes, offline_convert, monkeypatch):
-        def _explode(spec):
+        # ``**kwargs`` because the pipeline hands the builder the source image
+        # as well now; a stand-in that refused it would fail with a TypeError
+        # of its own and stop testing what it is named for.
+        def _explode(spec, **kwargs):
             raise pptx_builder.PptxBuildError("python-pptx said no")
 
         monkeypatch.setattr(pptx_builder, "build_presentation", _explode)
@@ -1408,7 +1713,7 @@ class TestBuildFromJson:
         assert envelope(response)["code"] == "invalid_spec"
 
     def test_build_failed(self, client, monkeypatch):
-        def _explode(spec):
+        def _explode(spec, **kwargs):
             raise pptx_builder.PptxBuildError("cannot render")
 
         monkeypatch.setattr(pptx_builder, "build_presentation", _explode)
@@ -2064,9 +2369,9 @@ class TestEndpointsDoNotBlockTheEventLoop:
         seen: dict[str, str] = {}
         real_build = converter.build_deck
 
-        def _build(spec):
+        def _build(spec, **kwargs):
             seen["where"] = self._loop_state()
-            return real_build(spec)
+            return real_build(spec, **kwargs)
 
         monkeypatch.setattr(converter, "build_deck", _build)
 
@@ -2078,9 +2383,9 @@ class TestEndpointsDoNotBlockTheEventLoop:
         seen: dict[str, str] = {}
         real_build = converter.build_deck
 
-        def _build(spec):
+        def _build(spec, **kwargs):
             seen["where"] = self._loop_state()
-            return real_build(spec)
+            return real_build(spec, **kwargs)
 
         monkeypatch.setattr(converter, "build_deck", _build)
 
@@ -2092,9 +2397,9 @@ class TestEndpointsDoNotBlockTheEventLoop:
         seen: dict[str, str] = {}
         real_build = converter.build_deck
 
-        def _build(spec):
+        def _build(spec, **kwargs):
             seen["where"] = self._loop_state()
-            return real_build(spec)
+            return real_build(spec, **kwargs)
 
         monkeypatch.setattr(converter, "build_deck", _build)
 

@@ -13,14 +13,19 @@ Nothing here touches the network: a preview needs no model and no key.
 
 from __future__ import annotations
 
+import base64
 import copy
+import io
 import json
+import os
+import types
 
 import pytest
 from fastapi.testclient import TestClient
 from pptx import Presentation
 from pptx.enum.dml import MSO_THEME_COLOR
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
+from pptx.oxml.ns import qn
 from pptx.util import Inches
 
 from app import config, mock_data, pptx_builder
@@ -48,21 +53,26 @@ def _no_key(monkeypatch):
     monkeypatch.setattr(config, "LITELLM_API_KEY", "", raising=False)
 
 
-def preview_of(spec_payload) -> dict:
+def preview_of(spec_payload, *, source_image: bytes | None = None) -> dict:
     """Build ``spec_payload`` for real and return the preview of the deck.
 
     Mirrors the order the product uses: bytes first, preview second (see
     ``converter.preview_for`` - reading the slide background mutates the XML).
+
+    ``source_image`` is the original uploaded image, needed only by an ``image``
+    element (the builder crops its region out of it). It defaults to ``None``
+    because that is what ``/api/preview`` and ``/api/build-from-json`` have, and
+    every test written before the feature existed is still correct as it stands.
     """
     spec = SlideSpec.model_validate(spec_payload)
-    presentation, _bytes = converter.build_deck(spec)
+    presentation, _bytes = converter.build_deck(spec, source_image=source_image)
     return preview_module.build_preview(presentation)
 
 
-def built(spec_payload):
+def built(spec_payload, *, source_image: bytes | None = None):
     """``(preview, slide)`` so a test can compare the payload with the deck."""
     spec = SlideSpec.model_validate(spec_payload)
-    presentation, _bytes = converter.build_deck(spec)
+    presentation, _bytes = converter.build_deck(spec, source_image=source_image)
     return preview_module.build_preview(presentation), presentation.slides[0]
 
 
@@ -540,6 +550,448 @@ class TestTables:
 
 
 # =========================================================================== #
+# connectors - the one payload with no box at all
+# =========================================================================== #
+class TestConnectors:
+    """``ConnectorElement`` has no bbox: it is two points, so the payload
+    reports ``start_pct``/``end_pct``. Everything here goes through the real
+    builder, and the arrowhead assertions go through a SAVE/RELOAD as well,
+    because the arrowheads are raw ``a:ln`` XML that python-pptx has no API for
+    - a round trip is the only proof they are really in the file.
+    """
+
+    LINE = {
+        "type": "connector",
+        "kind": "straight",
+        "start_point": [125, 300],
+        "end_point": [480, 300],
+        "arrow_start": False,
+        "arrow_end": True,
+        "dash_style": "solid",
+        "color": "#1E3A6E",
+        "width_pt": 1.5,
+    }
+
+    def test_the_payload_is_exactly_the_pinned_contract(self):
+        """Asserted as a whole dict, not field by field: an extra key, a missing
+        key or a renamed one is a contract break the UI would have to guess at,
+        so the shape is pinned here rather than sampled."""
+        assert preview_of(one(self.LINE))["shapes"][0] == {
+            "kind": "connector",
+            "start_pct": {"x": 12.5, "y": 30.0},
+            "end_pct": {"x": 48.0, "y": 30.0},
+            "elbow": False,
+            "arrow_start": False,
+            "arrow_end": True,
+            "dash": "solid",
+            "color": "#1E3A6E",
+            "width_pt": 1.5,
+        }
+
+    def test_x_scales_by_the_slide_width_and_y_by_its_height(self):
+        """The load-bearing axis pairing, on the payload that reports POINTS.
+
+        The coordinates are deliberately asymmetric - 250 across and 750 down,
+        then 800 across and 100 down - so swapping the two denominators reads
+        as 75/25 instead of 25/75 rather than coming out equal by luck.
+        """
+        connector = preview_of(
+            one({**self.LINE, "start_point": [250, 750], "end_point": [800, 100]})
+        )["shapes"][0]
+
+        assert connector["start_pct"] == {"x": 25.0, "y": 75.0}
+        assert connector["end_pct"] == {"x": 80.0, "y": 10.0}
+
+    def test_the_percentages_are_the_decks_own_emu_not_the_specs_numbers(self):
+        """Same rule as every other kind: the preview reports the deck."""
+        preview, slide = built(one(self.LINE))
+        connector = next(
+            shape for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.LINE
+        )
+        payload = preview["shapes"][0]
+
+        assert payload["start_pct"]["x"] == pytest.approx(
+            connector.begin_x / SLIDE_W_EMU * 100, abs=1e-3
+        )
+        assert payload["start_pct"]["y"] == pytest.approx(
+            connector.begin_y / SLIDE_H_EMU * 100, abs=1e-3
+        )
+        assert payload["end_pct"]["x"] == pytest.approx(
+            connector.end_x / SLIDE_W_EMU * 100, abs=1e-3
+        )
+        assert payload["end_pct"]["y"] == pytest.approx(
+            connector.end_y / SLIDE_H_EMU * 100, abs=1e-3
+        )
+
+    def test_a_right_to_left_connector_keeps_its_start_at_the_start(self):
+        """python-pptx stores a reversed connector as a normalized box plus
+        ``flipH``/``flipV``, and reads ``begin_x``/``begin_y`` back THROUGH the
+        flip. Reporting the bounding box instead would put the arrowhead at the
+        wrong end of an upstream arrow - a wrong diagram, not a wrong pixel.
+        """
+        connector = preview_of(
+            one({**self.LINE, "start_point": [900, 800], "end_point": [100, 200]})
+        )["shapes"][0]
+
+        assert connector["start_pct"] == {"x": 90.0, "y": 80.0}
+        assert connector["end_pct"] == {"x": 10.0, "y": 20.0}
+
+    def test_a_connector_carries_no_box_fields_at_all(self):
+        """A box would be a second, disagreeing source of truth for the UI."""
+        connector = preview_of(one(self.LINE))["shapes"][0]
+        assert not {"left_pct", "top_pct", "width_pct", "height_pct"} & set(connector)
+
+    @pytest.mark.parametrize(
+        ("kind", "elbow", "preset"),
+        [("straight", False, "line"), ("elbow", True, "bentConnector3")],
+    )
+    def test_the_elbow_flag_is_read_off_the_decks_own_geometry(
+        self, kind, elbow, preset
+    ):
+        preview, slide = built(one({**self.LINE, "kind": kind}))
+        connector = next(
+            shape for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.LINE
+        )
+
+        assert preview["shapes"][0]["elbow"] is elbow
+        # The flag really does come from the file, not from the spec.
+        assert connector._element.spPr.find(qn("a:prstGeom")).get("prst") == preset
+
+    @pytest.mark.parametrize(
+        ("arrow_start", "arrow_end"),
+        [(False, True), (True, False), (True, True), (False, False)],
+    )
+    def test_both_arrowheads_survive_a_save_and_reload(self, arrow_start, arrow_end):
+        """The arrowheads are raw ``<a:headEnd>``/``<a:tailEnd>`` XML - there is
+        no python-pptx API for them on 1.0.2 - so they are asserted on a deck
+        that has been through the zip, which is what the user opens."""
+        spec = SlideSpec.model_validate(
+            one({**self.LINE, "arrow_start": arrow_start, "arrow_end": arrow_end})
+        )
+        _presentation, data = converter.build_deck(spec)
+
+        connector = preview_module.build_preview(
+            Presentation(io.BytesIO(data))
+        )["shapes"][0]
+
+        assert connector["arrow_start"] is arrow_start
+        assert connector["arrow_end"] is arrow_end
+
+    @pytest.mark.parametrize("dash_style", ["solid", "dashed"])
+    def test_the_dash_style_is_reported_as_the_contracts_two_values(self, dash_style):
+        connector = preview_of(one({**self.LINE, "dash_style": dash_style}))["shapes"][0]
+        assert connector["dash"] == dash_style
+
+    def test_an_unusable_colour_reads_as_null_and_the_width_falls_back(self):
+        """House rule: degrade, never raise. A garbage colour is ``None`` (the
+        UI then draws the theme's line), and a missing width becomes the
+        builder's own default rather than ``null``."""
+        connector = preview_of(
+            one(
+                {
+                    "type": "connector",
+                    "start_point": [100, 100],
+                    "end_point": [900, 100],
+                    "color": "not-a-colour",
+                }
+            )
+        )["shapes"][0]
+
+        assert connector["color"] is None
+        assert connector["width_pt"] == pytest.approx(config.DEFAULT_BORDER_WIDTH_PT)
+
+    def test_a_connector_is_detected_as_line_because_connector_does_not_exist(self):
+        """Guards the one fact that would silently detect nothing: python-pptx
+        1.0.2 has no ``MSO_SHAPE_TYPE.CONNECTOR``, and a connector reports as
+        ``LINE``. If a future release adds ``CONNECTOR``, this fails and the
+        detection list gets revisited on purpose."""
+        assert not hasattr(MSO_SHAPE_TYPE, "CONNECTOR")
+
+        _preview, slide = built(one(self.LINE))
+        connector = next(iter(slide.shapes))
+        assert connector.shape_type == MSO_SHAPE_TYPE.LINE
+
+    def test_a_connector_shares_the_z_order_with_everything_else(self):
+        preview = preview_of(
+            {
+                "elements": [
+                    {"type": "shape", "kind": "rectangle", "bbox": [0, 0, 100, 100]},
+                    self.LINE,
+                    {"type": "text", "bbox": [0, 0, 100, 100], "content": "x"},
+                ]
+            }
+        )
+        assert kinds(preview) == ["shape", "connector", "text"]
+
+
+# =========================================================================== #
+# images - the crop the deck really carries
+# =========================================================================== #
+#: The source image every crop test is taken from, in pixels. Deliberately not
+#: square, and not the slide's aspect ratio, so mapping the bbox onto the wrong
+#: axis shows up as the wrong pixels rather than as a near miss.
+SOURCE_PX = (1000, 700)
+
+#: The region ``TestImages.IMAGE`` claims, and the colour painted into exactly
+#: that region of the source. A crop taken from anywhere else is not red.
+CROP_RGB = (220, 40, 40)
+
+
+def source_png(size=SOURCE_PX, *, bbox=(600, 200, 300, 400), noise=False) -> bytes:
+    """A PNG whose ``bbox`` region (normalized 0..1000) is solid :data:`CROP_RGB`.
+
+    Everything outside that region is white, so a crop that came from the wrong
+    place is obvious from the decoded bytes alone - the test does not have to
+    trust the builder's arithmetic to check the preview's.
+    """
+    from PIL import Image
+
+    width, height = size
+    if noise:
+        # Real photographic content compresses nothing like a flat fill; the
+        # downscale test needs bytes that actually shrink.
+        image = Image.frombytes("RGB", size, os.urandom(width * height * 3))
+    else:
+        image = Image.new("RGB", size, (255, 255, 255))
+    x, y, w, h = bbox
+    left = round(x / config.COORD_SCALE * width)
+    top = round(y / config.COORD_SCALE * height)
+    right = round((x + w) / config.COORD_SCALE * width)
+    bottom = round((y + h) / config.COORD_SCALE * height)
+    if not noise:
+        image.paste(Image.new("RGB", (right - left, bottom - top), CROP_RGB), (left, top))
+
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def decoded(data_uri: str):
+    """``(content_type, PIL image)`` for a ``data:`` URI the preview produced."""
+    from PIL import Image
+
+    header, _, payload = data_uri.partition(",")
+    assert header.endswith(";base64"), header
+    raw = base64.b64decode(payload)
+    return header[len("data:") : -len(";base64")], Image.open(io.BytesIO(raw)), raw
+
+
+class _FakeSlide:
+    def __init__(self, shapes):
+        self.shapes = shapes
+
+
+class _FakePresentation:
+    """The smallest thing ``build_preview`` can walk.
+
+    Used only for the two cases a real deck cannot be made to reach - a picture
+    whose bytes cannot be read at all - because the point is what the preview
+    does when the DECK is broken, and a deck python-pptx refuses to build
+    cannot be handed to it.
+    """
+
+    def __init__(self, shapes):
+        self.slide_width = SLIDE_W_EMU
+        self.slide_height = SLIDE_H_EMU
+        self.slides = [_FakeSlide(shapes)]
+
+
+class _UnreadablePicture:
+    shape_type = MSO_SHAPE_TYPE.PICTURE
+    left, top, width, height = 0, 0, SLIDE_W_EMU // 4, SLIDE_H_EMU // 4
+    name = "Picture 1"
+
+    @property
+    def image(self):
+        raise KeyError("the image part is not in the package")
+
+
+class _EmptyPicture(_UnreadablePicture):
+    @property
+    def image(self):
+        return types.SimpleNamespace(blob=b"", content_type="image/png", size=(0, 0))
+
+
+class TestImages:
+    """An ``image`` element is a region the analyzer could not express natively,
+    cropped out of the source image by the builder. The preview reads the crop
+    back out of the DECK, so these tests check the bytes that were really
+    embedded rather than the bytes that were uploaded.
+    """
+
+    IMAGE = {"type": "image", "bbox": [600, 200, 300, 400], "description": "팀 사진"}
+
+    #: A small native text box. The builder's anti-flattening rule 3 drops a
+    #: picture that is a slide's ONLY content, so an image element can never be
+    #: previewed on its own - every spec here carries one native object with it.
+    #: It is listed second, so the image stays ``shapes[0]``.
+    NATIVE = {"type": "text", "bbox": [0, 920, 200, 60], "content": "본문"}
+
+    def spec(self, element=None) -> dict:
+        return {"elements": [element or self.IMAGE, self.NATIVE]}
+
+    def preview(self, element=None, **kwargs) -> dict:
+        return preview_of(self.spec(element), source_image=source_png(**kwargs))
+
+    def test_the_payload_is_exactly_the_pinned_contract(self):
+        payload = self.preview()["shapes"][0]
+
+        assert set(payload) == {
+            "kind",
+            "left_pct",
+            "top_pct",
+            "width_pct",
+            "height_pct",
+            "data_uri",
+            "description",
+        }
+        assert payload["kind"] == "image"
+        assert payload["left_pct"] == 60.0
+        assert payload["top_pct"] == 20.0
+        assert payload["width_pct"] == 30.0
+        assert payload["height_pct"] == 40.0
+        assert payload["data_uri"].startswith("data:image/")
+
+    def test_x_scales_by_the_slide_width_and_y_by_its_height(self):
+        """Same asymmetric-box argument as ``TestGeometryPercentages``: 500
+        across is 50% of the WIDTH and 250 down is 25% of the HEIGHT."""
+        payload = self.preview(
+            {**self.IMAGE, "bbox": [200, 500, 500, 250]},
+            bbox=(200, 500, 500, 250),
+        )["shapes"][0]
+
+        assert payload["left_pct"] == 20.0
+        assert payload["top_pct"] == 50.0
+        assert payload["width_pct"] == 50.0
+        assert payload["height_pct"] == 25.0
+
+    def test_the_data_uri_is_the_crop_that_really_went_into_the_deck(self):
+        """Not the source image, and not the bbox re-cropped a second time
+        here: the bytes are read from the picture shape, so a builder that
+        cropped the wrong region has to show up in the preview."""
+        preview, slide = built(self.spec(), source_image=source_png())
+        picture = next(
+            shape for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+        )
+
+        _content_type, image, _raw = decoded(preview["shapes"][0]["data_uri"])
+        # The region painted into the source was solid CROP_RGB, and the crop
+        # covers exactly that region, so every corner of the thumbnail is red.
+        flat = image.convert("RGB")
+        for point in ((0, 0), (flat.width - 1, 0), (0, flat.height - 1)):
+            for channel, expected in zip(flat.getpixel(point), CROP_RGB):
+                assert abs(channel - expected) <= 8, (point, flat.getpixel(point))
+
+        # ...and it really is the deck's own blob that was read.
+        from PIL import Image as PILImage
+
+        embedded = PILImage.open(io.BytesIO(picture.image.blob)).convert("RGB")
+        assert embedded.getpixel((0, 0))[:3] == CROP_RGB
+
+    def test_the_crop_is_downscaled_to_the_cap_and_gets_smaller(self):
+        """The invariant is the pixel size; the byte reduction is the point of
+        having it. A noisy source is used on purpose - a flat fill compresses
+        to nothing either way and would prove neither."""
+        big = source_png(size=(2000, 1400), noise=True)
+        preview, slide = built(self.spec(), source_image=big)
+        picture = next(
+            shape for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+        )
+
+        # The crop as embedded is larger than the preview cap on both counts.
+        assert max(picture.image.size) > preview_module.PREVIEW_IMAGE_MAX_PX
+
+        _content_type, image, raw = decoded(preview["shapes"][0]["data_uri"])
+        assert max(image.size) <= preview_module.PREVIEW_IMAGE_MAX_PX
+        assert len(raw) < len(picture.image.blob), "the downscale saved nothing"
+
+    def test_every_data_uri_fits_the_cap(self):
+        payload = self.preview(size=(2000, 1400), noise=True)["shapes"][0]
+        assert len(payload["data_uri"]) <= preview_module.PREVIEW_IMAGE_MAX_URI_BYTES
+
+    def test_a_crop_too_big_for_the_cap_becomes_null_with_a_warning(
+        self, monkeypatch, capsys
+    ):
+        """A preview may not turn a JSON response into a multi-megabyte
+        download. The cap is lowered rather than the image made enormous, so
+        the test stays fast and asserts the behaviour, not Pillow's ratios."""
+        monkeypatch.setattr(preview_module, "PREVIEW_IMAGE_MAX_URI_BYTES", 64)
+
+        payload = self.preview()["shapes"][0]
+        assert payload["data_uri"] is None
+        # ...and it says so, rather than leaving a mystery gap in the panel.
+        stderr = capsys.readouterr().err
+        assert preview_module.WARN_PREFIX in stderr
+        assert "too large" in stderr
+
+    def test_a_picture_whose_bytes_cannot_be_read_becomes_null_with_a_warning(
+        self, capsys
+    ):
+        preview = preview_module.build_preview(
+            _FakePresentation([_UnreadablePicture()])
+        )
+        payload = preview["shapes"][0]
+
+        assert payload["kind"] == "image"
+        assert payload["data_uri"] is None
+        assert "could not be read" in capsys.readouterr().err
+
+    def test_a_picture_with_no_bytes_becomes_null_with_a_warning(self, capsys):
+        preview = preview_module.build_preview(_FakePresentation([_EmptyPicture()]))
+
+        assert preview["shapes"][0]["data_uri"] is None
+        assert "no embedded bytes" in capsys.readouterr().err
+
+    def test_the_description_is_read_off_the_decks_alt_text(self):
+        """The preview reads the DECK, so the description has to be IN the deck:
+        ``<p:cNvPr descr>`` is where it belongs. This builds a picture by hand
+        because that is the only way to test the read independently of whether
+        the builder writes it yet."""
+        presentation = Presentation()
+        presentation.slide_width = Inches(config.SLIDE_WIDTH_IN)
+        presentation.slide_height = Inches(config.SLIDE_HEIGHT_IN)
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        picture = slide.shapes.add_picture(
+            io.BytesIO(source_png(size=(40, 30))), 0, 0, Inches(1), Inches(1)
+        )
+        picture._element._nvXxPr.cNvPr.set("descr", "팀 사진")
+
+        payload = preview_module.build_preview(presentation)["shapes"][0]
+        assert payload["description"] == "팀 사진"
+
+    @pytest.mark.parametrize("descr", ["image.png", "slide_2.JPEG", "photo.webp"])
+    def test_python_pptxs_own_default_alt_text_is_never_shown_as_a_description(
+        self, descr
+    ):
+        """``add_picture`` from a stream sets ``descr="image.png"`` itself, and
+        from a path it sets the basename. Reporting either would tell the user
+        the model described the region as "image.png", which is a false claim -
+        the field is ``null`` instead."""
+        presentation = Presentation()
+        presentation.slide_width = Inches(config.SLIDE_WIDTH_IN)
+        presentation.slide_height = Inches(config.SLIDE_HEIGHT_IN)
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        picture = slide.shapes.add_picture(
+            io.BytesIO(source_png(size=(40, 30))), 0, 0, Inches(1), Inches(1)
+        )
+        picture._element._nvXxPr.cNvPr.set("descr", descr)
+
+        payload = preview_module.build_preview(presentation)["shapes"][0]
+        assert payload["description"] is None
+
+    def test_a_picture_only_slide_never_reaches_the_preview_at_all(self):
+        """Not this module's rule, but its consequence: the builder's
+        anti-flattening pass drops a picture that is the slide's only content,
+        so the preview of such a spec shows the warning's aftermath - no image
+        entry - rather than a flattened slide."""
+        preview = preview_of(
+            one({"type": "image", "bbox": [0, 0, 1000, 1000]}),
+            source_image=source_png(bbox=(0, 0, 1000, 1000)),
+        )
+        assert "image" not in kinds(preview)
+
+
+# =========================================================================== #
 # shapes the product never emits
 # =========================================================================== #
 class TestUnsupportedShapes:
@@ -548,19 +1000,21 @@ class TestUnsupportedShapes:
         assert "unsupported" not in kinds(preview)
         assert set(kinds(preview)) <= {"shape", "text", "table"}
 
-    def test_a_picture_would_be_reported_as_unsupported_not_crash(self, tmp_path):
-        """There are never any - nothing is ever flattened - but if one
-        appeared, the preview must degrade rather than take the response down
-        with it."""
-        from make_sample_image import make_sample_image
+    def test_a_shape_type_with_no_payload_degrades_to_unsupported(self):
+        """The fallback still exists, and still reports geometry.
 
-        image = make_sample_image(tmp_path / "pic.png", size=(320, 180))
-
+        A picture used to land here; it now has a payload of its own (see
+        ``TestImages``), so the guard is pointed at a shape kind the builder
+        genuinely never emits - a group - which has neither a text frame nor a
+        table and must therefore degrade rather than take the response down.
+        """
         presentation = Presentation()
         presentation.slide_width = Inches(config.SLIDE_WIDTH_IN)
         presentation.slide_height = Inches(config.SLIDE_HEIGHT_IN)
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])
-        slide.shapes.add_picture(str(image), Inches(1), Inches(1), Inches(2), Inches(1))
+        group = slide.shapes.add_group_shape()
+        group.left, group.top = Inches(1), Inches(1)
+        group.width, group.height = Inches(2), Inches(1)
 
         preview = preview_module.build_preview(presentation)
         shape = preview["shapes"][0]
@@ -852,7 +1306,7 @@ class TestPreviewEndpoint:
         assert response.json()["detail"]["code"] == "invalid_spec"
 
     def test_a_build_failure_is_build_failed(self, client, monkeypatch):
-        def _explode(spec):
+        def _explode(spec, **kwargs):
             raise pptx_builder.PptxBuildError("python-pptx said no")
 
         monkeypatch.setattr(pptx_builder, "build_presentation", _explode)
@@ -899,6 +1353,97 @@ class TestPreviewEndpoint:
             assert payload_shape["height_pct"] == pytest.approx(
                 real.height / SLIDE_H_EMU * 100, abs=0.001
             )
+
+
+# =========================================================================== #
+# POST /api/preview has no source image - and says so
+# =========================================================================== #
+class TestPreviewEndpointWithoutASourceImage:
+    """``/api/preview`` and ``/api/build-from-json`` are handed a spec and
+    nothing else, so an ``image`` element in one of them cannot be cropped.
+
+    The pinned preview payload allows ``data_uri: null``, but that is for a
+    picture that IS in the deck and whose crop could not be shipped. Here there
+    is no picture at all: the builder skips the element (per-element render
+    isolation), warns, and draws a dashed placeholder outline instead. The
+    preview is derived from the BUILT deck, so it reports the placeholder that
+    is really on the slide - inventing an ``image`` entry would mean re-deriving
+    the payload from the spec, which is the one thing this module must not do.
+    """
+
+    IMAGE = {"type": "image", "bbox": [600, 200, 300, 400], "description": "팀 사진"}
+    NATIVE = {"type": "text", "bbox": [0, 920, 200, 60], "content": "본문"}
+
+    def payload(self) -> dict:
+        return {"elements": [self.IMAGE, self.NATIVE]}
+
+    def test_it_answers_200_and_still_builds_the_rest_of_the_slide(self, client):
+        response = client.post("/api/preview", json=self.payload())
+        assert response.status_code == 200
+        body = response.json()
+
+        assert body["status"] == "success"
+        # The element validated, so it is NOT a drop - it is a render-time skip.
+        assert body["dropped"] == []
+        assert body["counts"]["image"] == 1
+        assert body["total"] == 2
+        # ...and the text box beside it is on the slide, untouched.
+        assert "text" in kinds(body["preview"])
+
+    def test_no_image_entry_is_invented_for_a_crop_that_never_happened(
+        self, client
+    ):
+        preview = client.post("/api/preview", json=self.payload()).json()["preview"]
+        assert "image" not in kinds(preview)
+
+    def test_the_placeholder_outline_is_previewed_where_the_image_would_be(
+        self, client
+    ):
+        """The gap is visible rather than mysterious: the builder leaves a
+        dashed outline at the bbox, and the preview shows it as the native
+        shape it really is."""
+        preview = client.post("/api/preview", json=self.payload()).json()["preview"]
+        placeholder = preview["shapes"][0]
+
+        assert placeholder["kind"] == "shape"
+        assert placeholder["left_pct"] == pytest.approx(60.0, abs=0.01)
+        assert placeholder["top_pct"] == pytest.approx(20.0, abs=0.01)
+        assert placeholder["width_pct"] == pytest.approx(30.0, abs=0.01)
+        assert placeholder["height_pct"] == pytest.approx(40.0, abs=0.01)
+        assert placeholder["fill_color"] is None, "a placeholder is see-through"
+
+    def test_a_warning_names_the_missing_source_and_what_to_do(self, client):
+        """Never a silent omission. The line has to say that the element was
+        NOT rendered and that an image element needs the conversion that still
+        has the original image."""
+        body = client.post("/api/preview", json=self.payload()).json()
+        lines = [line for line in body["warnings"] if "image" in line]
+
+        assert lines, body["warnings"]
+        joined = "\n".join(lines)
+        assert "NOT rendered" in joined
+        assert "no source image" in joined
+        assert "re-run the conversion" in joined
+
+    def test_build_from_json_warns_the_same_way_and_still_returns_a_deck(
+        self, client
+    ):
+        """The binary endpoint cannot carry a warnings array, so the one thing
+        that must hold is that the deck is still real and is not silently
+        missing a slide."""
+        response = client.post("/api/build-from-json", json=self.payload())
+        assert response.status_code == 200
+        assert response.content[:2] == b"PK"
+
+        presentation = Presentation(io.BytesIO(response.content))
+        shapes = list(presentation.slides[0].shapes)
+        assert not [
+            shape for shape in shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+        ]
+        # The placeholder and the text box: nothing was dropped on the floor.
+        assert len(shapes) == 2
+        assert json.loads(response.headers["x-element-counts"])["image"] == 1
+        assert response.headers["x-dropped-count"] == "0"
 
 
 # =========================================================================== #

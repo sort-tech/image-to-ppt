@@ -12,6 +12,7 @@ import base64
 import importlib
 import json
 import os
+import re
 
 import pytest
 from PIL import Image
@@ -401,16 +402,78 @@ class TestExtractJsonNeverBlanksTheSlide:
 # ---------------------------------------------------------------------------
 # SYSTEM_PROMPT
 # ---------------------------------------------------------------------------
+#: The prompt on one line, so a rule that wraps across source lines can still
+#: be matched as the sentence it is.
+_FLAT_PROMPT = " ".join(SYSTEM_PROMPT.split())
+
+
 class TestSystemPrompt:
     def test_is_a_substantive_instruction(self):
         assert isinstance(SYSTEM_PROMPT, str)
         assert len(SYSTEM_PROMPT) > 200
 
     @pytest.mark.parametrize(
-        "token", ["1000", "bbox", "json", "shape", "table", "text", "elements"]
+        "token",
+        [
+            "1000",
+            "bbox",
+            "json",
+            "shape",
+            "table",
+            "text",
+            "elements",
+            "connector",
+            "image",
+            "start_point",
+            "end_point",
+            "arrow_start",
+            "arrow_end",
+            "dash_style",
+            "elbow",
+            "arrow_right",
+        ],
     )
     def test_states_the_contract(self, token):
         assert token in SYSTEM_PROMPT.lower(), f"SYSTEM_PROMPT never mentions {token!r}"
+
+    def test_it_says_a_connector_carries_endpoints_instead_of_a_bbox(self):
+        assert re.search(r'connector has NO "bbox"', _FLAT_PROMPT), (
+            "the model has to be told the one element type that has no bbox"
+        )
+
+    def test_it_separates_a_block_arrow_from_a_connector(self):
+        """Both are "arrows"; the model must know which is which, or every
+        diagram line comes back as a fat rectangle-with-a-point."""
+        assert re.search(r"BLOCK arrows?", _FLAT_PROMPT)
+        arrow_rule = re.search(r"arrow_\*[^.]*\.", _FLAT_PROMPT)
+        assert arrow_rule is not None
+        assert "connector" in re.search(
+            r'thin arrow that\s+merely joins two boxes[^.]*\.', _FLAT_PROMPT
+        ).group(0)
+
+    def test_it_forbids_marking_native_objects_as_an_image(self):
+        """The whole point of the project: a box, a label or a grid must stay
+        editable, so it may never be handed back as a cropped picture."""
+        rule = re.search(r'NEVER mark an[^.]*as "image"[^.]*\.', _FLAT_PROMPT)
+        assert rule is not None, 'SYSTEM_PROMPT never forbids native-object-as-"image"'
+        matched = rule.group(0).lower()
+        for word in ("box", "text", "table"):
+            assert word in matched, f"the rule does not mention a {word}"
+
+    def test_it_forbids_one_image_covering_the_whole_slide(self):
+        assert re.search(
+            r'NEVER emit one "image" covering the whole slide', _FLAT_PROMPT
+        ), "SYSTEM_PROMPT never forbids the whole-slide image - that IS the flattening"
+
+    def test_it_also_forbids_a_few_big_images_tiling_the_slide(self):
+        """One 95%-of-the-slide picture is not the only way to flatten a slide;
+        four quarter-slide pictures do it too, so the prompt says both."""
+        assert "tile the slide" in _FLAT_PROMPT
+
+    def test_a_photo_is_no_longer_simply_omitted(self):
+        """The old prompt told the model to DROP photographs and logos, which is
+        exactly the region "image" now exists to keep."""
+        assert re.search(r"photograph.*is NOT omitted", _FLAT_PROMPT)
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +755,93 @@ class TestPartialElementDrop:
         assert spec.dropped == []
         assert len(spec.elements) == 1
         assert capsys.readouterr().err == "", "nothing was dropped, so nothing to say"
+
+
+# ---------------------------------------------------------------------------
+# connectors, block arrows and image regions: end to end through the analyzer
+# ---------------------------------------------------------------------------
+_CONNECTOR = {
+    "type": "connector",
+    "start_point": [120, 300],
+    "end_point": [480, 300],
+    "kind": "elbow",
+    "dash_style": "dashed",
+    "arrow_end": True,
+    "color": "#1E3A6E",
+    "width_pt": 1.5,
+}
+_IMAGE = {"type": "image", "bbox": [600, 200, 300, 400], "description": "team photo"}
+_BLOCK_ARROW = {"type": "shape", "bbox": [400, 500, 120, 60], "kind": "arrow_right"}
+
+
+class TestTheNewElementTypesReachTheSpec:
+    def test_a_reply_using_every_new_type_validates(self, tmp_path, capsys):
+        client = FakeClient(_reply(_GOOD_SHAPE, _BLOCK_ARROW, _CONNECTOR, _IMAGE, _GOOD_TEXT))
+        spec = analyze_image(_png(tmp_path), client=client)
+
+        assert [el.type for el in spec.elements] == [
+            "shape",
+            "shape",
+            "connector",
+            "image",
+            "text",
+        ]
+        assert spec.dropped == []
+        assert capsys.readouterr().err == "", "a clean reply warns about nothing"
+
+        assert spec.elements[1].kind == "arrow_right"
+        connector = spec.elements[2]
+        assert connector.kind == "elbow"
+        assert connector.dash_style == "dashed"
+        assert (connector.arrow_start, connector.arrow_end) == (False, True)
+        assert connector.start_point.as_tuple() == (120, 300)
+        assert connector.end_point.as_tuple() == (480, 300)
+        assert connector.color == "#1E3A6E" and connector.width_pt == 1.5
+        assert not hasattr(connector, "bbox"), "a connector has no bounding box"
+        assert spec.elements[3].description == "team photo"
+
+    def test_counts_by_type_reports_them(self, tmp_path):
+        client = FakeClient(_reply(_CONNECTOR, _CONNECTOR, _IMAGE, _GOOD_TEXT))
+        counts = analyze_image(_png(tmp_path), client=client).counts_by_type()
+        assert counts == {"connector": 2, "image": 1, "text": 1}
+
+    def test_a_bare_array_of_connectors_is_still_recovered(self, tmp_path):
+        """``extract_json`` recovers a bare array only if the entries LOOK like
+        elements - and a connector has no bbox to recognize it by."""
+        reply = json.dumps([_CONNECTOR, _IMAGE])
+        spec = analyze_image(_png(tmp_path), client=FakeClient(reply))
+        assert [el.type for el in spec.elements] == ["connector", "image"]
+
+    def test_a_bare_array_of_connectors_is_recognized_by_extract_json(self):
+        payload = json.loads(extract_json(json.dumps([_CONNECTOR])))
+        assert [el["type"] for el in payload["elements"]] == ["connector"]
+
+    def test_a_connector_with_a_broken_endpoint_costs_only_itself(self, tmp_path, capsys):
+        broken = {"type": "connector", "start_point": [1, 2], "end_point": {"x": 5}}
+        client = FakeClient(_reply(broken, _GOOD_SHAPE))
+        spec = analyze_image(_png(tmp_path), client=client)
+
+        assert [el.type for el in spec.elements] == ["shape"]
+        assert spec.dropped == [
+            "element 0 (connector): end_point - 'y' is missing or unreadable"
+        ]
+        assert "missing or unreadable" in capsys.readouterr().err
+
+    def test_a_slide_of_nothing_but_broken_connectors_still_raises(self, tmp_path):
+        broken = {"type": "connector", "start_point": [1, 2]}
+        with pytest.raises(VisionAnalysisError) as excinfo:
+            analyze_image(_png(tmp_path), client=FakeClient(_reply(broken)))
+        message = str(excinfo.value)
+        assert "end_point - Field required" in message
+        assert "blank" in message.lower()
+
+    def test_the_schema_hint_describes_both_new_types(self, tmp_path):
+        """The user turn carries ``llm_json_schema()``; a type missing from it is
+        a type the model will not emit."""
+        parts = build_messages("QUJD", "image/png")[1]["content"]
+        hint = next(p for p in parts if p["type"] == "text")["text"]
+        for token in ("connector", "start_point", "end_point", "arrow_end", "image"):
+            assert token in hint, f"{token!r} missing from the request's schema hint"
 
 
 # ---------------------------------------------------------------------------

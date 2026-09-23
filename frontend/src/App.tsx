@@ -73,11 +73,26 @@ interface EditedOutcome {
   preview: SlidePreview | null;
 }
 
-/** "파일명: 도형 3개, 표 1개, 텍스트 상자 6개 - 요소 2개 건너뜀" */
+/** "파일명: 도형 3개, 표 1개, 텍스트 상자 6개, 연결선 2개 - 요소 2개 건너뜀" */
 function describeDeck(deck: BuiltDeck): string {
   const counts = deck.counts;
+  // 연결선/이미지 are appended only when there are some. The three original
+  // tallies are always shown, but a diagram-less slide reporting "연결선 0개,
+  // 이미지 0개" would be noise on every single download; omitting a zero
+  // category states nothing untrue.
+  const extras = counts
+    ? [
+        counts.connector > 0 ? `연결선 ${counts.connector}개` : null,
+        counts.image > 0 ? `이미지 ${counts.image}개` : null,
+      ].filter((part): part is string => part !== null)
+    : [];
   const tally = counts
-    ? `도형 ${counts.shape}개, 표 ${counts.table}개, 텍스트 상자 ${counts.text}개`
+    ? [
+        `도형 ${counts.shape}개`,
+        `표 ${counts.table}개`,
+        `텍스트 상자 ${counts.text}개`,
+        ...extras,
+      ].join(", ")
     : "생성 완료";
   const droppedNote =
     deck.droppedCount && deck.droppedCount > 0

@@ -645,16 +645,55 @@ def _warn_dropped(spec, source: str = "the model's reply") -> int:
     return len(dropped)
 
 
+def _embedded_picture_count(output: Path) -> int | None:
+    """How many pictures the WRITTEN deck really contains, or ``None`` if unknown.
+
+    Read back off the saved file through the shared
+    :func:`pptx_builder.flattening_report`, not inferred from the spec: an
+    ``image`` element does not always become a picture (no source image to crop
+    from, or the anti-flattening pass refused it), and the summary line below is
+    a claim about the deck, so it has to come from the deck.
+
+    A deck that was just written successfully must never fail the run because
+    this bookkeeping could not be re-read, so every failure degrades to
+    ``None`` and the caller simply says less.
+    """
+    try:
+        from pptx import Presentation
+
+        from app.pptx_builder import flattening_report
+
+        return int(flattening_report(Presentation(str(output)))["picture_count"])
+    except Exception:  # noqa: BLE001 - a summary line may never break a build
+        return None
+
+
 def _print_summary(output: Path, spec, saved_json: Path | None) -> None:
     counts = _element_counts(spec)
     print(f"Wrote {output}")
     print(f"  {_format_counts(counts)}")
     if saved_json is not None:
         print(f"  spec JSON: {saved_json}")
-    if counts:
+    if not counts:
+        print("  The slide is blank - nothing was rendered.")
+        return
+
+    # "All objects are native" is a claim, and since `image` elements exist it is
+    # no longer automatically true: a cropped region IS an embedded picture. Say
+    # which it is, rather than printing the reassuring sentence over a deck that
+    # contains a photo. Everything else on the slide is still native, and that is
+    # the part worth promising.
+    pictures = _embedded_picture_count(output)
+    if pictures is None:
+        print("  Shapes, tables and text boxes are native PowerPoint objects - editable.")
+    elif pictures == 0:
         print("  All objects are native PowerPoint shapes/tables/text boxes - fully editable.")
     else:
-        print("  The slide is blank - nothing was rendered.")
+        plural = "s" if pictures != 1 else ""
+        print(
+            f"  {pictures} cropped image region{plural} embedded as picture{plural}; "
+            "every other object is a native PowerPoint shape/table/text box - editable."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -699,6 +738,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ---- 1. obtain a validated SlideSpec -------------------------------- #
     spec = None
     spec_source = "the model's reply"  # names the source in the "skipped" warning
+    #: The image the analyzer looked at, for cropping ``image`` elements back out
+    #: of. Stays None on the --from-json path, which genuinely has no source
+    #: image - those elements are then skipped with a warning by the builder.
+    source_image: Path | None = None
     if args.from_json:
         json_path = Path(args.from_json).expanduser()
         if not json_path.exists():
@@ -723,6 +766,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             image_path = validate_input_path(args.input)
         except CliUsageError as exc:
             return _usage_error(str(exc))
+        # This path DOES have the original image, so image elements can really be
+        # cropped here; the builder takes a path as readily as bytes.
+        source_image = image_path
 
         if verbose:
             try:
@@ -771,7 +817,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _fail(exc, "could not load the pptx builder", verbose)
 
     try:
-        written = build_pptx(spec, output_path)
+        written = build_pptx(spec, output_path, source_image=source_image)
     except Exception as exc:
         return _fail(exc, f"could not build {output_path}", verbose)
 

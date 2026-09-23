@@ -452,6 +452,11 @@ def failure_from_exception(
 # --------------------------------------------------------------------------- #
 _PPTX_WARN_PREFIX = "[pptx_builder] warning: "
 _VISION_WARN_PREFIX = "[vision_analyzer] "
+#: ``preview.py`` reports a field it had to give up on - a crop too large to
+#: ship, a picture whose bytes could not be read - the same way every other
+#: module reports a non-fatal problem: on stderr. Stripping the prefix here is
+#: what puts those lines in the response's ``warnings`` array.
+_PREVIEW_WARN_PREFIX = preview_module.WARN_PREFIX
 
 _capture_local = threading.local()
 _capture_install_lock = threading.Lock()
@@ -569,6 +574,8 @@ def warning_lines(text: str, *, ignore: list[str] | None = None) -> list[str]:
             line = line[len(_PPTX_WARN_PREFIX) :]
         elif line.startswith(_VISION_WARN_PREFIX):
             line = line[len(_VISION_WARN_PREFIX) :]
+        elif line.startswith(_PREVIEW_WARN_PREFIX):
+            line = line[len(_PREVIEW_WARN_PREFIX) :]
         if line in skip:
             continue
         # The second way an upstream error body reaches a client: when the
@@ -938,7 +945,9 @@ def _temp_image(data: bytes, extension: str) -> Iterator[Path]:
             pass
 
 
-def build_deck(spec: SlideSpec) -> tuple[Any, bytes]:
+def build_deck(
+    spec: SlideSpec, *, source_image: bytes | str | Path | None = None
+) -> tuple[Any, bytes]:
     """Render ``spec`` IN MEMORY, returning the ``Presentation`` AND its bytes.
 
     ``build_pptx`` only writes to a path, so ``build_presentation`` is used
@@ -951,16 +960,27 @@ def build_deck(spec: SlideSpec) -> tuple[Any, bytes]:
     min-dimension floor, the off-slide clipping and the cleaned text that the
     builder applied. The bytes are produced FIRST, deliberately: see
     :func:`preview_for`.
+
+    ``source_image`` is the ORIGINAL uploaded image - bytes here, since that is
+    what the HTTP layer holds; the CLI passes a path. The builder needs it to
+    crop an ``image`` element's region back out of it. It is keyword-only and
+    optional because two of the three entry points genuinely do not have one:
+    ``/api/preview`` and ``/api/build-from-json`` are handed a spec and nothing
+    else. Passing ``None`` is not a failure - the builder skips each ``image``
+    element through its per-element render isolation, which lands a warning
+    saying so in the response.
     """
-    presentation = pptx_builder.build_presentation(spec)
+    presentation = pptx_builder.build_presentation(spec, source_image=source_image)
     buffer = io.BytesIO()
     presentation.save(buffer)
     return presentation, buffer.getvalue()
 
 
-def build_bytes(spec: SlideSpec) -> bytes:
+def build_bytes(
+    spec: SlideSpec, *, source_image: bytes | str | Path | None = None
+) -> bytes:
     """Render ``spec`` to .pptx bytes IN MEMORY, discarding the deck object."""
-    return build_deck(spec)[1]
+    return build_deck(spec, source_image=source_image)[1]
 
 
 def preview_for(presentation: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -1040,7 +1060,12 @@ def convert_upload(
         dropped = [str(reason) for reason in (getattr(spec, "dropped", None) or [])]
 
         try:
-            presentation, pptx_bytes = build_deck(spec)
+            # The uploaded bytes go down with the spec: an ``image`` element is
+            # a REGION OF THIS IMAGE, and the builder crops it back out. This is
+            # the only entry point that has the source image at all, which is
+            # why /api/preview and /api/build-from-json can only warn about
+            # those elements rather than render them.
+            presentation, pptx_bytes = build_deck(spec, source_image=data)
         except Exception as exc:  # noqa: BLE001
             raise failure_from_exception(exc, context="build") from exc
 
@@ -1070,6 +1095,13 @@ def build_from_payload(payload: Any, *, with_preview: bool = False) -> Conversio
     with the binary and would only pay for a payload it then discards.
     ``/api/preview`` asks for it and throws the BYTES away instead - the deck is
     still built either way, which is what makes the preview's geometry real.
+
+    Neither endpoint has the source image: a spec is all that was sent. So
+    ``build_deck`` is called WITHOUT ``source_image``, and an ``image`` element
+    in the payload cannot be cropped. That is not made into a failure and it is
+    not hidden either - the builder skips the element and warns, and the warning
+    travels out in ``warnings`` like any other, saying that the conversion has
+    to be re-run for the crop. Everything else in the spec still builds.
 
     Raises:
         ConversionFailure: 400 ``invalid_spec`` or 500 ``build_failed``.

@@ -48,15 +48,64 @@ function num(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+/**
+ * A single point on the same normalized 0..1000 grid, as the API returns it.
+ *
+ * Same object/tuple split as {@link BBox}, and for the same reason: the
+ * backend's `Point` is a pydantic model, so a *response* always carries the
+ * object form `{"x":120,"y":300}`, while `[x, y]` is an accepted *input* that
+ * hand-edited JSON in the spec editor may legitimately use.
+ */
+export interface Point {
+  x: number;
+  y: number;
+}
+
+/** The positional input form the backend also accepts: `[x, y]`. */
+export type PointTuple = [number, number];
+
+/** Either accepted point form. Use {@link pointToTuple} to read one uniformly. */
+export type PointLike = Point | PointTuple;
+
+/** Reads either point form into `[x, y]`, with 0 for anything unreadable. */
+export function pointToTuple(point: PointLike | null | undefined): PointTuple {
+  if (Array.isArray(point)) {
+    return [num(point[0]), num(point[1])];
+  }
+  if (point && typeof point === "object") {
+    return [num(point.x), num(point.y)];
+  }
+  return [0, 0];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Elements                                                                   */
 /* -------------------------------------------------------------------------- */
 
-export type ShapeKind = "rectangle" | "rounded_rectangle" | "circle";
+/**
+ * The autoshape geometries the builder can draw.
+ *
+ * The four `arrow_*` kinds are BLOCK arrows - filled autoshapes with a bbox,
+ * not connectors. A line between two boxes is a {@link ConnectorElement}.
+ */
+export type ShapeKind =
+  | "rectangle"
+  | "rounded_rectangle"
+  | "circle"
+  | "arrow_right"
+  | "arrow_left"
+  | "arrow_up"
+  | "arrow_down";
 export type Align = "left" | "center" | "right";
 
+/** Straight or one-bend orthogonal, matching `MSO_CONNECTOR.STRAIGHT/.ELBOW`. */
+export type ConnectorKind = "straight" | "elbow";
+
+/** The two line dash presets the builder maps to `MSO_LINE_DASH_STYLE`. */
+export type DashStyle = "solid" | "dashed";
+
 /** The `type` discriminant values, which are also the `counts` keys. */
-export type ElementType = "shape" | "table" | "text";
+export type ElementType = "shape" | "table" | "text" | "connector" | "image";
 
 interface BaseElement {
   bbox: BBox;
@@ -90,8 +139,51 @@ export interface TextElement extends BaseElement {
   align?: Align;
 }
 
+/**
+ * A diagram connector: a line between two points, with optional arrowheads.
+ *
+ * It deliberately does **not** extend `BaseElement`, mirroring the backend:
+ * a connector has no bbox at all, its geometry is `start_point`/`end_point`.
+ * Anything walking `SlideSpec.elements` therefore has to narrow on `type`
+ * before reaching for `bbox` - which is why `BaseElement` is not on the union
+ * as a common supertype.
+ */
+export interface ConnectorElement {
+  type: "connector";
+  kind?: ConnectorKind;
+  start_point: PointLike;
+  end_point: PointLike;
+  /** Arrowhead at `start_point`. Defaults to false server-side. */
+  arrow_start?: boolean;
+  /** Arrowhead at `end_point`. Defaults to **true** server-side. */
+  arrow_end?: boolean;
+  dash_style?: DashStyle;
+  color?: string | null;
+  width_pt?: number | null;
+}
+
+/**
+ * A region of the SOURCE image, cropped out and placed as a real picture.
+ *
+ * This is the one element that is not vector-native, and it exists for the
+ * regions that genuinely cannot be one: a photo, a rendered chart, a logo. The
+ * builder crops `bbox` out of the uploaded image, so a build with no source
+ * image to crop from (`/api/preview`, `/api/build-from-json`) cannot render it
+ * and says so in `warnings`.
+ */
+export interface ImageElement extends BaseElement {
+  type: "image";
+  /** What the analyzer saw there, e.g. "team photo". Model-supplied text. */
+  description?: string | null;
+}
+
 /** Discriminated on `type`, matching the backend's `Element` union. */
-export type SlideElement = ShapeElement | TableElement | TextElement;
+export type SlideElement =
+  | ShapeElement
+  | TableElement
+  | TextElement
+  | ConnectorElement
+  | ImageElement;
 
 /* -------------------------------------------------------------------------- */
 /* Spec                                                                       */
@@ -148,7 +240,14 @@ interface PreviewBox {
   height_pct: number;
 }
 
-/** The autoshape geometries the builder can emit, plus a catch-all. */
+/**
+ * The autoshape geometries the builder can emit, plus a catch-all.
+ *
+ * NOTE: the block-arrow `ShapeKind`s are NOT listed here, because the preview
+ * payload does not name them - `MSO_SHAPE.RIGHT_ARROW` and friends come back
+ * as `"other"`, which the renderer draws as the shape's bounding box. The
+ * arrow is in the deck; only the preview shows it square.
+ */
 export type PreviewAutoShape = "rectangle" | "rounded_rectangle" | "oval" | "other";
 
 /** A native autoshape. A null colour means "none", not "black". */
@@ -199,12 +298,60 @@ export interface PreviewTable extends PreviewBox {
   rows: PreviewTableCell[][];
 }
 
+/** A point on the slide, in percent of slide width / height. */
+export interface PreviewPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * A connector, read back off the built deck's `MSO_SHAPE_TYPE.LINE` shape.
+ *
+ * Unlike every other preview item this carries NO {@link PreviewBox}: a
+ * connector is two endpoints, and its `begin_x/begin_y/end_x/end_y` are what
+ * the server reports (as percentages). Code that walks `shapes` must narrow on
+ * `kind` before reading `left_pct`.
+ *
+ * `elbow` only says the deck used `bentConnector3`; the actual bend offsets are
+ * the preset's, so the exact route is not in the payload.
+ */
+export interface PreviewConnector {
+  kind: "connector";
+  start_pct: PreviewPoint;
+  end_pct: PreviewPoint;
+  elbow: boolean;
+  arrow_start: boolean;
+  arrow_end: boolean;
+  dash: DashStyle;
+  /** null when the deck left the line colour to the theme. */
+  color: string | null;
+  /** null when the deck left the line width to the theme. */
+  width_pt: number | null;
+}
+
+/**
+ * A picture, read back off the built deck's `MSO_SHAPE_TYPE.PICTURE` shape.
+ *
+ * `data_uri` is the image bytes that are genuinely embedded in the .pptx
+ * (`shape.image.blob`), downscaled and size-capped for transport - not the
+ * source image, and not a re-crop. It is null when the server could not inline
+ * the crop, and then it also adds a line to `warnings`; the picture itself is
+ * still in the deck, so the renderer shows a labelled placeholder rather than
+ * claiming the image is missing.
+ */
+export interface PreviewImage extends PreviewBox {
+  kind: "image";
+  data_uri: string | null;
+  /** The analyzer's own words for the region. Model-supplied text. */
+  description: string | null;
+}
+
 /**
  * A shape the backend could not describe.
  *
- * The builder never emits pictures, so in practice this never appears; it
- * exists so an unexpected shape degrades into a placeholder instead of
- * failing the conversion.
+ * Pictures and connectors now have their own kinds, so this stays what it
+ * always was: the degrade path, so an unexpected shape becomes a placeholder
+ * instead of failing the conversion.
  */
 export interface PreviewUnsupported extends PreviewBox {
   kind: "unsupported";
@@ -215,6 +362,8 @@ export type PreviewShapeItem =
   | PreviewShape
   | PreviewText
   | PreviewTable
+  | PreviewConnector
+  | PreviewImage
   | PreviewUnsupported;
 
 /** The whole preview. `shapes` is already in z-order, back to front. */

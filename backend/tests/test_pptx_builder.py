@@ -1,20 +1,28 @@
 """Builder tests: geometry, styling, z-order, and the anti-flattening proof.
 
-The most important test in this file is
-:meth:`TestBuildPptx.test_reopened_deck_contains_no_picture_shapes` - it is the
-one that proves the tool produced an *editable* deck instead of pasting the
-input image onto a slide.
+The most important tests in this file are the anti-flattening ones -
+:class:`TestFlatteningReport` and
+:meth:`TestBuildPptx.test_a_spec_without_image_elements_embeds_no_picture_at_all`.
+They are what proves the tool produced an *editable* deck instead of pasting the
+input image onto a slide. "Zero picture shapes" is no longer the rule, because a
+photo/chart region is now a legitimate cropped sub-image; the rule is
+:func:`pptx_builder.flattening_report`, and it is shared with the API so there is
+exactly one definition of "flattened".
 """
 
 from __future__ import annotations
 
+import io
 import re
 import zipfile
+from typing import get_args
 
 import pytest
+from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
+from pptx.enum.dml import MSO_FILL, MSO_LINE_DASH_STYLE
+from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE, MSO_SHAPE_TYPE
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Inches, Pt
 
@@ -22,25 +30,127 @@ from app import config
 from app import mock_data
 from app import pptx_builder
 from app.pptx_builder import (
+    ARROW_HEAD_TYPE,
+    CONNECTOR_MAP,
+    FULL_BLEED_PICTURE_PCT,
+    MAX_PICTURE_AREA_PCT,
     PLAIN_TABLE_STYLE_ID,
     SHAPE_MAP,
     TABLE_FONT_DARK,
     TABLE_FONT_LIGHT,
+    PictureSourceError,
     PptxBuildError,
+    add_connector,
+    add_picture,
     add_shape,
     add_table,
     add_textbox,
     build_pptx,
     build_presentation,
+    flattening_report,
     scale_bbox,
+    scale_point,
     to_rgb,
 )
-from app.schemas import BBox, ShapeElement, SlideSpec, TableElement, TextElement
+from app.schemas import (
+    BBox,
+    ConnectorElement,
+    ConnectorKind,
+    ImageElement,
+    Point,
+    ShapeElement,
+    ShapeKind,
+    SlideSpec,
+    TableElement,
+    TextElement,
+)
 
 # 0.0001 inch: guards against float-ordering noise without letting a real
 # geometry bug through.
 EMU_TOL = 100
 INCH = 914400
+
+#: A source image with four flat, unmistakable quadrants. Deliberately NOT
+#: square and not a multiple of the 0..1000 grid, so a crop that mixes the two
+#: axes up - or rounds sloppily - lands on the wrong colour and fails loudly.
+SOURCE_PX = (400, 200)
+QUADRANTS = {
+    "top_left": ((0, 0, 200, 100), (255, 0, 0)),
+    "top_right": ((200, 0, 400, 100), (0, 255, 0)),
+    "bottom_left": ((0, 100, 200, 200), (0, 0, 255)),
+    "bottom_right": ((200, 100, 400, 200), (255, 255, 0)),
+}
+#: The same four quadrants in the normalized 0..1000 bbox system.
+QUADRANT_BBOX = {
+    "top_left": [0, 0, 500, 500],
+    "top_right": [500, 0, 500, 500],
+    "bottom_left": [0, 500, 500, 500],
+    "bottom_right": [500, 500, 500, 500],
+}
+
+
+def _source_image() -> Image.Image:
+    """The four-quadrant source image (see :data:`QUADRANTS`)."""
+    image = Image.new("RGB", SOURCE_PX, (0, 0, 0))
+    for box, color in QUADRANTS.values():
+        image.paste(Image.new("RGB", (box[2] - box[0], box[3] - box[1]), color), box[:2])
+    return image
+
+
+def _source_bytes(image: Image.Image | None = None, fmt: str = "PNG") -> bytes:
+    buffer = io.BytesIO()
+    (image or _source_image()).save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+def _source_path(tmp_path, image: Image.Image | None = None):
+    path = tmp_path / "source.png"
+    path.write_bytes(_source_bytes(image))
+    return path
+
+
+def _pictures(slide) -> list:
+    return [s for s in slide.shapes if s.shape_type in
+            (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE)]
+
+
+def _connectors(slide) -> list:
+    return [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.LINE]
+
+
+def _embedded_crop(picture) -> Image.Image:
+    """The image bytes that really went INTO the deck, decoded again."""
+    return Image.open(io.BytesIO(picture.image.blob)).convert("RGB")
+
+
+def _colors(image: Image.Image) -> set:
+    """Every distinct colour in *image* (the crop is flat, so this is tiny)."""
+    counted = image.getcolors(maxcolors=1 << 24)
+    assert counted is not None, "the crop has an implausible number of colours"
+    return {color for _count, color in counted}
+
+
+def _ln_children(shape) -> list[str]:
+    """The local tag names of the shape's ``a:ln`` children, in document order."""
+    ln = shape.line._get_or_add_ln()
+    return [child.tag.split("}")[-1] for child in ln]
+
+
+def _category(shape) -> str:
+    """Classify a rendered shape the same way the spec classifies elements."""
+    if shape.has_table:
+        return "table"
+    stype = shape.shape_type
+    if stype == MSO_SHAPE_TYPE.TEXT_BOX:
+        return "text"
+    if stype == MSO_SHAPE_TYPE.AUTO_SHAPE:
+        return "shape"
+    # A connector reports as LINE; there is no MSO_SHAPE_TYPE.CONNECTOR member.
+    if stype == MSO_SHAPE_TYPE.LINE:
+        return "connector"
+    if stype in (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE):
+        return "image"
+    return f"unexpected({stype})"
 
 
 def _force(model, field: str, value) -> None:
@@ -57,18 +167,6 @@ def _blank_deck():
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
     return prs, prs.slides.add_slide(prs.slide_layouts[6])
-
-
-def _category(shape) -> str:
-    """Classify a rendered shape the same way the spec classifies elements."""
-    if shape.has_table:
-        return "table"
-    stype = shape.shape_type
-    if stype == MSO_SHAPE_TYPE.TEXT_BOX:
-        return "text"
-    if stype == MSO_SHAPE_TYPE.AUTO_SHAPE:
-        return "shape"
-    return f"unexpected({stype})"
 
 
 def _expected_categories(spec: SlideSpec) -> list[str]:
@@ -103,10 +201,22 @@ def test_build_error_is_an_exception():
 
 
 def test_shape_map_covers_every_shape_kind():
-    assert set(SHAPE_MAP) == {"rectangle", "rounded_rectangle", "circle"}
+    # Derived from the schema literal, so a kind added there without a preset
+    # here (which would silently render as a rectangle) fails this test.
+    assert set(SHAPE_MAP) == set(get_args(ShapeKind))
     assert SHAPE_MAP["rectangle"] == MSO_SHAPE.RECTANGLE
     assert SHAPE_MAP["rounded_rectangle"] == MSO_SHAPE.ROUNDED_RECTANGLE
     assert SHAPE_MAP["circle"] == MSO_SHAPE.OVAL
+    assert SHAPE_MAP["arrow_right"] == MSO_SHAPE.RIGHT_ARROW
+    assert SHAPE_MAP["arrow_left"] == MSO_SHAPE.LEFT_ARROW
+    assert SHAPE_MAP["arrow_up"] == MSO_SHAPE.UP_ARROW
+    assert SHAPE_MAP["arrow_down"] == MSO_SHAPE.DOWN_ARROW
+
+
+def test_connector_map_covers_every_connector_kind():
+    assert set(CONNECTOR_MAP) == set(get_args(ConnectorKind))
+    assert CONNECTOR_MAP["straight"] == MSO_CONNECTOR.STRAIGHT
+    assert CONNECTOR_MAP["elbow"] == MSO_CONNECTOR.ELBOW
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +756,838 @@ class TestControlCharacters:
 
 
 # ---------------------------------------------------------------------------
+# scale_point: connector endpoints
+# ---------------------------------------------------------------------------
+class TestScalePoint:
+    def test_maps_the_full_coordinate_space_onto_the_slide(self):
+        assert scale_point(Point(x=0, y=0)) == (0, 0)
+        x, y = scale_point(Point(x=1000, y=1000))
+        assert abs(x - Inches(13.333)) <= EMU_TOL
+        assert abs(y - Inches(7.5)) <= EMU_TOL
+
+    def test_x_scales_by_width_and_y_by_height(self):
+        """The two axes are scaled independently - like scale_bbox, not squared."""
+        x, y = scale_point(Point(x=500, y=500))
+        assert abs(x - Inches(0.5 * 13.333)) <= EMU_TOL
+        assert abs(y - Inches(0.5 * 7.5)) <= EMU_TOL
+        assert x != y, "a 1:1 point must NOT land on the same EMU on both axes"
+
+    def test_returns_two_integral_emu_values(self):
+        values = scale_point(Point(x=123, y=456))
+        assert len(values) == 2
+        assert all(isinstance(value, int) for value in values)  # Emu subclasses int
+
+    def test_a_point_that_fits_is_silent(self, capsys):
+        scale_point(Point(x=250, y=750))
+        assert capsys.readouterr().err == ""
+
+    def test_an_out_of_range_point_is_clamped_and_reported(self, capsys):
+        """Point already clamps 0..1000; a forced value may still not move silently."""
+        point = Point(x=1, y=1)
+        _force(point, "x", 2000)
+        x, y = scale_point(point)
+        assert abs(x - Inches(13.333)) <= EMU_TOL
+        err = capsys.readouterr().err
+        assert err.strip(), "a moved endpoint must not be silent"
+        assert "outside the" in err and "slide" in err, err
+
+    def test_an_unreadable_component_raises_so_the_element_is_skipped(self):
+        point = Point(x=1, y=1)
+        _force(point, "y", "banana")
+        with pytest.raises((TypeError, ValueError)):
+            scale_point(point)
+
+
+# ---------------------------------------------------------------------------
+# add_connector
+# ---------------------------------------------------------------------------
+def _connector(**kwargs) -> ConnectorElement:
+    payload = {
+        "type": "connector",
+        "start_point": [100, 200],
+        "end_point": [800, 600],
+    }
+    payload.update(kwargs)
+    return ConnectorElement.model_validate(payload)
+
+
+class TestAddConnector:
+    def test_geometry_matches_the_two_points(self):
+        _, slide = _blank_deck()
+        el = _connector()
+        shape = add_connector(slide, el)
+        assert (shape.begin_x, shape.begin_y) == scale_point(el.start_point)
+        assert (shape.end_x, shape.end_y) == scale_point(el.end_point)
+
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [("straight", MSO_CONNECTOR.STRAIGHT), ("elbow", MSO_CONNECTOR.ELBOW)],
+    )
+    def test_the_kind_selects_the_connector_preset(self, kind, expected):
+        _, slide = _blank_deck()
+        shape = add_connector(slide, _connector(kind=kind))
+        prst = shape._element.spPr.find(
+            "{http://schemas.openxmlformats.org/drawingml/2006/main}prstGeom"
+        )
+        assert prst is not None
+        assert prst.get("prst") == ("bentConnector3" if kind == "elbow" else "line")
+
+    def test_a_connector_reports_as_a_line_shape(self):
+        """Verified: MSO_SHAPE_TYPE.CONNECTOR does not exist; a connector is LINE.
+
+        The preview detects connectors by this value, so it is asserted here.
+        """
+        _, slide = _blank_deck()
+        shape = add_connector(slide, _connector())
+        assert shape.shape_type == MSO_SHAPE_TYPE.LINE
+        assert _category(shape) == "connector"
+
+    def test_colour_and_width_are_applied(self):
+        _, slide = _blank_deck()
+        shape = add_connector(slide, _connector(color="#1E3A6E", width_pt=1.5))
+        assert shape.line.color.rgb == RGBColor(0x1E, 0x3A, 0x6E)
+        assert shape.line.width == Pt(1.5)
+
+    def test_a_missing_width_falls_back_to_the_config_default(self):
+        _, slide = _blank_deck()
+        shape = add_connector(slide, _connector(color="#000000"))
+        assert shape.line.width == Pt(config.DEFAULT_BORDER_WIDTH_PT)
+
+    def test_a_garbage_width_degrades_to_the_config_default(self):
+        _, slide = _blank_deck()
+        el = _connector()
+        _force(el, "width_pt", "wide-ish")
+        shape = add_connector(slide, el)
+        assert shape.line.width == Pt(config.DEFAULT_BORDER_WIDTH_PT)
+
+    def test_a_garbage_colour_degrades_to_no_explicit_colour(self):
+        """No colour must mean "theme line", NOT "invisible" and NOT a crash.
+
+        A connector is a line: making it invisible (what a shape's missing
+        border colour means) would delete the arrow the diagram is about.
+        """
+        _, slide = _blank_deck()
+        el = _connector()
+        _force(el, "color", "banana")
+        shape = add_connector(slide, el)  # must not raise
+        assert "solidFill" not in _ln_children(shape)
+        assert "noFill" not in _ln_children(shape), "a connector may not be invisible"
+        assert shape.shape_type == MSO_SHAPE_TYPE.LINE
+
+    @pytest.mark.parametrize(
+        ("dash_style", "expected"),
+        [("solid", MSO_LINE_DASH_STYLE.SOLID), ("dashed", MSO_LINE_DASH_STYLE.DASH)],
+    )
+    def test_the_dash_style_is_written_explicitly(self, dash_style, expected):
+        _, slide = _blank_deck()
+        shape = add_connector(slide, _connector(dash_style=dash_style))
+        assert shape.line.dash_style == expected, "the dash style may not be inherited"
+
+    @pytest.mark.parametrize(
+        ("arrow_start", "arrow_end", "expected"),
+        [
+            (False, False, []),
+            (True, False, ["headEnd"]),
+            (False, True, ["tailEnd"]),
+            (True, True, ["headEnd", "tailEnd"]),
+        ],
+    )
+    def test_arrowheads_are_written_on_the_requested_ends(
+        self, arrow_start, arrow_end, expected
+    ):
+        """``a:headEnd`` is the BEGIN point's arrowhead, ``a:tailEnd`` the END's."""
+        _, slide = _blank_deck()
+        shape = add_connector(
+            slide, _connector(arrow_start=arrow_start, arrow_end=arrow_end)
+        )
+        children = _ln_children(shape)
+        assert [tag for tag in children if tag.endswith("End")] == expected
+        for tag in ("a:headEnd", "a:tailEnd"):
+            local = tag.split(":")[1]
+            element = shape.line._get_or_add_ln().find(
+                "{http://schemas.openxmlformats.org/drawingml/2006/main}" + local
+            )
+            if local in expected:
+                assert element is not None
+                assert element.get("type") == ARROW_HEAD_TYPE
+            else:
+                assert element is None
+
+    def test_arrowheads_come_after_the_dash_style_in_the_xml(self):
+        """CT_LineProperties order is [fill, prstDash, ..., headEnd, tailEnd].
+
+        Colour/width/dash are set first and the arrowheads appended last for
+        exactly this reason; a wrong order is an invalid package.
+        """
+        _, slide = _blank_deck()
+        shape = add_connector(
+            slide,
+            _connector(color="#FF0000", width_pt=2, dash_style="dashed",
+                       arrow_start=True, arrow_end=True),
+        )
+        assert _ln_children(shape) == ["solidFill", "prstDash", "headEnd", "tailEnd"]
+
+    def test_a_right_to_left_connector_keeps_its_direction(self):
+        """python-pptx flips the frame; begin/end must still be begin/end.
+
+        The arrowheads are tied to the line's ends, so a connector drawn
+        backwards would otherwise point the wrong way.
+        """
+        _, slide = _blank_deck()
+        el = _connector(start_point=[900, 800], end_point=[100, 200])
+        shape = add_connector(slide, el)
+        assert (shape.begin_x, shape.begin_y) == scale_point(el.start_point)
+        assert (shape.end_x, shape.end_y) == scale_point(el.end_point)
+
+    def test_two_identical_points_do_not_break_the_build(self):
+        _, slide = _blank_deck()
+        el = _connector(start_point=[500, 500], end_point=[500, 500])
+        shape = add_connector(slide, el)
+        assert (shape.begin_x, shape.begin_y) == (shape.end_x, shape.end_y)
+
+    def test_setting_the_arrowheads_twice_does_not_duplicate_them(self):
+        _, slide = _blank_deck()
+        shape = add_connector(slide, _connector(arrow_start=True, arrow_end=True))
+        pptx_builder._set_arrow_heads(shape, start=True, end=False)
+        assert [tag for tag in _ln_children(shape) if tag.endswith("End")] == ["headEnd"]
+
+
+class TestConnectorsInTheSavedPackage:
+    """The arrowheads are raw XML, so prove they survive a real save/reload."""
+
+    #: All four arrow_start/arrow_end combinations, plus both kinds, both dash
+    #: styles, and an explicit colour/width - everything the writer can emit.
+    ELEMENTS = [
+        {"type": "connector", "start_point": [100, 300], "end_point": [480, 300],
+         "arrow_start": False, "arrow_end": True, "color": "#1E3A6E", "width_pt": 1.5},
+        {"type": "connector", "kind": "elbow", "start_point": [480, 300],
+         "end_point": [900, 700], "arrow_start": True, "arrow_end": True,
+         "dash_style": "dashed"},
+        {"type": "connector", "start_point": [100, 800], "end_point": [900, 800],
+         "arrow_start": False, "arrow_end": False},
+        {"type": "connector", "start_point": [100, 900], "end_point": [900, 900],
+         "arrow_start": True, "arrow_end": False},
+    ]
+    #: The ``a:ln`` arrowhead children each of the above must end up with.
+    EXPECTED_ENDS = [["tailEnd"], ["headEnd", "tailEnd"], [], ["headEnd"]]
+
+    @pytest.fixture()
+    def saved(self, tmp_path):
+        spec = SlideSpec.model_validate({"elements": list(self.ELEMENTS)})
+        out = build_pptx(spec, tmp_path / "connectors.pptx")
+        return out, Presentation(str(out)).slides[0]
+
+    def test_every_connector_reaches_the_package_with_its_endpoints(self, saved):
+        _, slide = saved
+        shapes = _connectors(slide)
+        assert len(shapes) == len(self.ELEMENTS)
+        for shape, payload in zip(shapes, self.ELEMENTS):
+            expected_begin = scale_point(Point.model_validate(payload["start_point"]))
+            expected_end = scale_point(Point.model_validate(payload["end_point"]))
+            assert (shape.begin_x, shape.begin_y) == expected_begin
+            assert (shape.end_x, shape.end_y) == expected_end
+
+    def test_the_elbow_stays_an_elbow(self, saved):
+        _, slide = saved
+        elbow = _connectors(slide)[1]
+        assert "bentConnector3" in elbow._element.xml
+
+    def test_every_arrowhead_combination_survives_the_round_trip(self, saved):
+        _, slide = saved
+        shapes = _connectors(slide)
+        assert len(shapes) == len(self.EXPECTED_ENDS)
+        for shape, expected in zip(shapes, self.EXPECTED_ENDS):
+            assert [t for t in _ln_children(shape) if t.endswith("End")] == expected
+
+    def test_the_child_order_in_the_saved_file_is_valid(self, saved):
+        _, slide = saved
+        for shape, expected in zip(_connectors(slide), self.EXPECTED_ENDS):
+            children = _ln_children(shape)
+            # prstDash is always written, and every arrowhead must follow it.
+            assert "prstDash" in children
+            for tag in expected:
+                assert children.index("prstDash") < children.index(tag), (
+                    "an arrowhead before a:prstDash is an invalid package"
+                )
+            if expected == ["headEnd", "tailEnd"]:
+                assert children.index("headEnd") < children.index("tailEnd")
+
+    def test_the_dash_styles_survive_the_round_trip(self, saved):
+        _, slide = saved
+        solid, dashed, _bare, _back = _connectors(slide)
+        assert solid.line.dash_style == MSO_LINE_DASH_STYLE.SOLID
+        assert dashed.line.dash_style == MSO_LINE_DASH_STYLE.DASH
+
+    def test_the_colour_and_width_survive_the_round_trip(self, saved):
+        _, slide = saved
+        styled = _connectors(slide)[0]
+        assert styled.line.color.rgb == RGBColor(0x1E, 0x3A, 0x6E)
+        assert styled.line.width == Pt(1.5)
+
+    def test_the_arrowheads_are_in_the_written_slide_xml(self, saved):
+        out, _ = saved
+        with zipfile.ZipFile(out) as zf:
+            xml = zf.read("ppt/slides/slide1.xml").decode("utf-8")
+        assert f'<a:headEnd type="{ARROW_HEAD_TYPE}"' in xml
+        assert f'<a:tailEnd type="{ARROW_HEAD_TYPE}"' in xml
+        assert '<a:prstDash val="dash"/>' in xml
+
+    def test_a_connector_is_not_a_picture(self, saved):
+        out, slide = saved
+        assert _pictures(slide) == []
+        with zipfile.ZipFile(out) as zf:
+            assert [n for n in zf.namelist() if n.startswith("ppt/media/")] == []
+
+
+# ---------------------------------------------------------------------------
+# block arrows (shape.kind), which are auto shapes and not connectors
+# ---------------------------------------------------------------------------
+class TestBlockArrows:
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [
+            ("arrow_right", MSO_SHAPE.RIGHT_ARROW),
+            ("arrow_left", MSO_SHAPE.LEFT_ARROW),
+            ("arrow_up", MSO_SHAPE.UP_ARROW),
+            ("arrow_down", MSO_SHAPE.DOWN_ARROW),
+        ],
+    )
+    def test_each_direction_maps_to_its_preset(self, kind, expected):
+        _, slide = _blank_deck()
+        shape = add_shape(
+            slide, ShapeElement(type="shape", kind=kind, bbox=[100, 100, 200, 100])
+        )
+        assert shape.auto_shape_type == expected
+        assert shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
+
+    def test_a_block_arrow_is_styled_like_any_other_shape(self):
+        _, slide = _blank_deck()
+        shape = add_shape(
+            slide,
+            ShapeElement(
+                type="shape",
+                kind="arrow_right",
+                bbox=[100, 100, 200, 100],
+                fill_color="#1F3B73",
+                border_color="#FF0000",
+                border_width=2.0,
+            ),
+        )
+        assert shape.fill.fore_color.rgb == RGBColor(0x1F, 0x3B, 0x73)
+        assert shape.line.color.rgb == RGBColor(0xFF, 0x00, 0x00)
+        assert shape.line.width == Pt(2.0)
+        assert shape.text_frame.text == ""
+
+    def test_the_arrows_survive_the_saved_package(self, tmp_path):
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "shape", "kind": kind, "bbox": [i * 200, 100, 150, 100]}
+                    for i, kind in enumerate(
+                        ("arrow_right", "arrow_left", "arrow_up", "arrow_down")
+                    )
+                ]
+            }
+        )
+        out = build_pptx(spec, tmp_path / "arrows.pptx")
+        slide = Presentation(str(out)).slides[0]
+        assert [s.auto_shape_type for s in slide.shapes] == [
+            MSO_SHAPE.RIGHT_ARROW,
+            MSO_SHAPE.LEFT_ARROW,
+            MSO_SHAPE.UP_ARROW,
+            MSO_SHAPE.DOWN_ARROW,
+        ]
+
+
+# ---------------------------------------------------------------------------
+# add_picture: the cropped sub-image
+# ---------------------------------------------------------------------------
+class TestAddPicture:
+    def test_the_crop_lands_at_the_bbox_position_and_size(self):
+        _, slide = _blank_deck()
+        el = ImageElement(type="image", bbox=[500, 0, 300, 400])
+        picture = add_picture(slide, el, _source_bytes())
+        left, top, width, height = scale_bbox(el.bbox)
+        assert abs(picture.left - left) <= EMU_TOL
+        assert abs(picture.top - top) <= EMU_TOL
+        assert abs(picture.width - width) <= EMU_TOL
+        assert abs(picture.height - height) <= EMU_TOL
+        assert picture.shape_type == MSO_SHAPE_TYPE.PICTURE
+
+    @pytest.mark.parametrize("quadrant", sorted(QUADRANT_BBOX))
+    def test_the_embedded_pixels_really_are_the_requested_region(self, quadrant):
+        """The test that proves the crop maths, so it is strict on purpose.
+
+        x/w map onto the source's WIDTH and y/h onto its HEIGHT. The source is
+        400x200 - deliberately not square - so swapping the axes, or scaling
+        both by the same number, picks a different quadrant and fails here.
+        """
+        _, slide = _blank_deck()
+        box, color = QUADRANTS[quadrant]
+        picture = add_picture(
+            slide,
+            ImageElement(type="image", bbox=QUADRANT_BBOX[quadrant]),
+            _source_bytes(),
+        )
+        crop = _embedded_crop(picture)
+        assert crop.size == (box[2] - box[0], box[3] - box[1])
+        assert _colors(crop) == {color}, f"{quadrant} crop is not the right region"
+
+    def test_an_off_grid_region_is_cropped_by_the_same_maths(self):
+        """A region that is not a whole quadrant: 1/8 of the width, 1/4 of it."""
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=[250, 500, 250, 250]), _source_bytes()
+        )
+        crop = _embedded_crop(picture)
+        # x: 250..500 of 1000 -> 100..200px of 400; y: 500..750 -> 100..150px of 200.
+        assert crop.size == (100, 50)
+        assert _colors(crop) == {QUADRANTS["bottom_left"][1]}
+
+    def test_the_crop_fills_the_bbox_even_when_the_aspect_ratios_differ(self):
+        """Documented behaviour: the axes scale independently, so it stretches."""
+        _, slide = _blank_deck()
+        el = ImageElement(type="image", bbox=[0, 0, 500, 100])
+        picture = add_picture(slide, el, _source_bytes())
+        _, _, width, height = scale_bbox(el.bbox)
+        assert abs(picture.width - width) <= EMU_TOL
+        assert abs(picture.height - height) <= EMU_TOL
+        crop = _embedded_crop(picture)
+        assert crop.size == (200, 20), "the crop itself follows the bbox, not the box"
+
+    def test_the_source_may_be_raw_bytes(self):
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=QUADRANT_BBOX["top_right"]),
+            _source_bytes(),
+        )
+        assert _colors(_embedded_crop(picture)) == {QUADRANTS["top_right"][1]}
+
+    def test_the_source_may_be_a_path(self, tmp_path):
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=QUADRANT_BBOX["top_right"]),
+            _source_path(tmp_path),
+        )
+        assert _colors(_embedded_crop(picture)) == {QUADRANTS["top_right"][1]}
+
+    def test_the_source_may_be_a_path_string(self, tmp_path):
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=QUADRANT_BBOX["bottom_right"]),
+            str(_source_path(tmp_path)),
+        )
+        assert _colors(_embedded_crop(picture)) == {QUADRANTS["bottom_right"][1]}
+
+    def test_a_jpeg_source_works_too(self):
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=QUADRANT_BBOX["top_left"]),
+            _source_bytes(fmt="JPEG"),
+        )
+        assert picture.width > 0  # decoded, cropped and embedded
+
+    @pytest.mark.parametrize(
+        ("source", "phrase"),
+        [
+            (None, "no source image"),
+            (b"", "empty"),
+            (b"this is not an image", "could not be decoded"),
+            ("/nonexistent/source.png", "could not be decoded"),
+        ],
+    )
+    def test_an_unusable_source_raises_picture_source_error(self, source, phrase):
+        _, slide = _blank_deck()
+        el = ImageElement(type="image", bbox=[100, 100, 200, 200])
+        with pytest.raises(PictureSourceError) as excinfo:
+            add_picture(slide, el, source)
+        assert phrase in str(excinfo.value)
+        assert len(slide.shapes) == 0, "a failed crop may not leave a shape behind"
+
+    def test_a_truncated_png_is_rejected_rather_than_half_drawn(self):
+        _, slide = _blank_deck()
+        truncated = _source_bytes()[: len(_source_bytes()) // 2]
+        with pytest.raises(PictureSourceError):
+            add_picture(slide, ImageElement(type="image", bbox=[0, 0, 200, 200]), truncated)
+        assert len(slide.shapes) == 0
+
+    def test_an_already_decoded_pil_image_is_accepted(self):
+        """build_presentation decodes once and reuses the image per element."""
+        _, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=QUADRANT_BBOX["bottom_left"]),
+            _source_image(),
+        )
+        assert _colors(_embedded_crop(picture)) == {QUADRANTS["bottom_left"][1]}
+
+    def test_a_cmyk_source_is_converted_rather_than_failing(self):
+        _, slide = _blank_deck()
+        cmyk = Image.new("CMYK", SOURCE_PX, (0, 0, 0, 0))
+        buffer = io.BytesIO()
+        cmyk.save(buffer, format="TIFF")
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=[0, 0, 400, 400]), buffer.getvalue()
+        )
+        assert picture.width > 0
+
+
+# ---------------------------------------------------------------------------
+# a missing source image: skipped, reported, and marked in the deck
+# ---------------------------------------------------------------------------
+class TestImageWithoutASourceImage:
+    """``/api/preview``, ``/api/build-from-json`` and ``--from-json`` have no image.
+
+    The element must not be silently omitted (a mystery hole) and must not fail
+    the build (the rest of the slide is fine): it is skipped through the normal
+    per-element isolation, reported as NOT rendered, and outlined.
+    """
+
+    SPEC = {
+        "elements": [
+            {"type": "text", "bbox": [0, 0, 400, 100], "content": "Quarterly"},
+            {"type": "image", "bbox": [500, 200, 300, 400], "description": "team photo"},
+        ]
+    }
+
+    def _build(self, **kwargs):
+        return build_presentation(SlideSpec.model_validate(self.SPEC), **kwargs)
+
+    def test_the_rest_of_the_slide_is_intact(self, capsys):
+        prs = self._build()
+        capsys.readouterr()
+        slide = prs.slides[0]
+        assert _pictures(slide) == []
+        texts = [s for s in slide.shapes if _category(s) == "text"]
+        assert len(texts) == 1 and "Quarterly" in texts[0].text_frame.text
+
+    def test_the_warning_says_it_was_not_rendered_and_why(self, capsys):
+        self._build()
+        err = capsys.readouterr().err
+        assert "was NOT rendered" in err, err
+        assert "image" in err
+        assert "no source image" in err, err
+        assert "re-run the conversion" in err, err
+
+    def test_a_placeholder_outline_marks_the_gap(self, capsys):
+        prs = self._build()
+        assert "placeholder" in capsys.readouterr().err
+        slide = prs.slides[0]
+        shapes = [s for s in slide.shapes if _category(s) == "shape"]
+        assert len(shapes) == 1, "exactly one placeholder outline"
+        placeholder = shapes[0]
+        left, top, width, height = scale_bbox(BBox.model_validate([500, 200, 300, 400]))
+        assert abs(placeholder.left - left) <= EMU_TOL
+        assert abs(placeholder.top - top) <= EMU_TOL
+        assert abs(placeholder.width - width) <= EMU_TOL
+        assert abs(placeholder.height - height) <= EMU_TOL
+        assert placeholder.fill.type == MSO_FILL.BACKGROUND, "it must not look like content"
+        assert placeholder.line.dash_style == MSO_LINE_DASH_STYLE.DASH
+        assert placeholder.text_frame.text == ""
+
+    def test_the_deck_still_saves_and_reopens(self, tmp_path):
+        out = build_pptx(SlideSpec.model_validate(self.SPEC), tmp_path / "nosource.pptx")
+        slide = Presentation(str(out)).slides[0]
+        assert len(slide.shapes) == 2
+        assert _pictures(slide) == []
+
+    def test_an_undecodable_source_is_reported_the_same_way(self, capsys):
+        prs = self._build(source_image=b"nonsense, not a PNG")
+        err = capsys.readouterr().err
+        assert "was NOT rendered" in err
+        assert "could not be decoded" in err, err
+        assert _pictures(prs.slides[0]) == []
+        assert len([s for s in prs.slides[0].shapes if _category(s) == "shape"]) == 1
+
+    def test_a_missing_source_file_is_reported_the_same_way(self, capsys, tmp_path):
+        prs = self._build(source_image=tmp_path / "does-not-exist.png")
+        err = capsys.readouterr().err
+        assert "was NOT rendered" in err and "could not be decoded" in err
+        assert _pictures(prs.slides[0]) == []
+
+    def test_every_image_element_gets_its_own_reason(self, capsys):
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "text", "bbox": [0, 0, 400, 100], "content": "t"},
+                    {"type": "image", "bbox": [0, 200, 200, 200]},
+                    {"type": "image", "bbox": [400, 200, 200, 200]},
+                ]
+            }
+        )
+        build_presentation(spec, b"nonsense")
+        err = capsys.readouterr().err
+        assert err.count("was NOT rendered") == 2, err
+
+    def test_an_unusable_source_is_ignored_when_no_element_needs_it(self, capsys):
+        """Decoding is lazy: a spec with no image element never touches it."""
+        prs = build_presentation(mock_data.sample_spec(), b"not an image at all")
+        assert capsys.readouterr().err == ""
+        assert len(prs.slides[0].shapes) == len(mock_data.sample_spec().elements)
+
+
+# ---------------------------------------------------------------------------
+# the anti-flattening rule (shared with the API via flattening_report)
+# ---------------------------------------------------------------------------
+class TestFlatteningReport:
+    """Three rules. Rule 1 is the user's; rules 2 and 3 close its holes.
+
+    1. no single picture covering the slide (>= 95% of both axes);
+    2. all pictures together <= 80% of the slide area - four 50%x50% pictures
+       each pass rule 1 while tiling the slide into the same flattened image;
+    3. a picture-only slide is flattened, whatever the sizes say.
+    """
+
+    def _deck_with(self, *bboxes, text: bool = True):
+        prs, slide = _blank_deck()
+        if text:
+            add_textbox(slide, TextElement(type="text", bbox=[0, 0, 100, 50], content="hi"))
+        for bbox in bboxes:
+            add_picture(slide, ImageElement(type="image", bbox=list(bbox)), _source_bytes())
+        return prs, slide
+
+    def test_the_report_shape_is_stable(self):
+        report = flattening_report(build_presentation(mock_data.sample_spec()))
+        assert set(report) == {
+            "flattened",
+            "violations",
+            "slide_count",
+            "picture_count",
+            "slides",
+        }
+        assert set(report["slides"][0]) == {
+            "index",
+            "picture_count",
+            "native_count",
+            "picture_area_pct",
+            "full_bleed_count",
+            "flattened",
+            "violations",
+        }
+
+    def test_a_deck_with_no_pictures_is_not_flattened(self):
+        report = flattening_report(build_presentation(mock_data.sample_spec()))
+        assert report["flattened"] is False
+        assert report["violations"] == []
+        assert report["picture_count"] == 0
+        assert report["slide_count"] == 1
+
+    def test_a_legitimate_small_sub_image_passes(self):
+        prs, _ = self._deck_with([600, 200, 300, 400])
+        report = flattening_report(prs)
+        assert report["flattened"] is False, report["violations"]
+        assert report["picture_count"] == 1
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(12.0, abs=0.5)
+
+    def test_rule_1_a_single_picture_covering_the_slide(self):
+        prs, _ = self._deck_with([0, 0, 1000, 1000])
+        report = flattening_report(prs)
+        assert report["flattened"] is True
+        assert report["slides"][0]["full_bleed_count"] == 1
+        assert any("both slide axes" in reason for reason in report["violations"])
+        # A full-bleed picture necessarily breaks the area rule as well; that is
+        # the two rules agreeing, not a bug.
+        assert any(f"{MAX_PICTURE_AREA_PCT:g}% limit" in r for r in report["violations"])
+
+    def test_rule_1_uses_both_axes(self):
+        """A full-width but short banner is not a flattened slide by itself."""
+        prs, _ = self._deck_with([0, 0, 1000, 200])
+        report = flattening_report(prs)
+        assert report["slides"][0]["full_bleed_count"] == 0
+        assert report["flattened"] is False, report["violations"]
+
+    def test_rule_2_four_half_size_tiles_still_flatten_the_slide(self):
+        """The hole in a per-picture 95% rule: each tile passes it, all four tile."""
+        prs, _ = self._deck_with(
+            [0, 0, 500, 500], [500, 0, 500, 500], [0, 500, 500, 500], [500, 500, 500, 500]
+        )
+        report = flattening_report(prs)
+        assert report["slides"][0]["full_bleed_count"] == 0, "no single tile is full-bleed"
+        assert report["flattened"] is True
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(100.0, abs=0.5)
+        assert any(f"{MAX_PICTURE_AREA_PCT:g}% limit" in r for r in report["violations"])
+
+    def test_rule_2_allows_exactly_the_limit(self):
+        prs, _ = self._deck_with([0, 0, 1000, 800])
+        report = flattening_report(prs)
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(80.0, abs=0.2)
+        assert report["flattened"] is False, report["violations"]
+
+    def test_rule_3_a_picture_only_slide_is_flattened(self):
+        prs, _ = self._deck_with([100, 100, 200, 200], text=False)
+        report = flattening_report(prs)
+        assert report["flattened"] is True
+        assert report["slides"][0]["native_count"] == 0
+        assert any("picture-only" in r or "no native shape" in r
+                   for r in report["violations"])
+
+    def test_rule_3_is_satisfied_by_any_native_object(self):
+        prs, _ = self._deck_with([100, 100, 200, 200])
+        assert flattening_report(prs)["flattened"] is False
+
+    def test_a_connector_counts_as_native_content(self):
+        prs, slide = _blank_deck()
+        add_picture(slide, ImageElement(type="image", bbox=[100, 100, 200, 200]),
+                    _source_bytes())
+        add_connector(slide, _connector())
+        assert flattening_report(prs)["flattened"] is False
+
+    def test_the_violations_name_the_slide(self):
+        prs, _ = self._deck_with([100, 100, 200, 200], text=False)
+        assert all(r.startswith("slide 1: ") for r in flattening_report(prs)["violations"])
+
+
+class TestTheBuilderRefusesToFlatten:
+    """The report is not advice: the build enforces it, loudly, per element."""
+
+    def _build(self, elements):
+        spec = SlideSpec.model_validate({"elements": elements})
+        return build_presentation(spec, _source_bytes())
+
+    def test_a_full_slide_image_element_is_skipped(self, capsys):
+        prs = self._build(
+            [
+                {"type": "text", "bbox": [0, 0, 300, 100], "content": "Title"},
+                {"type": "image", "bbox": [0, 0, 1000, 1000]},
+            ]
+        )
+        err = capsys.readouterr().err
+        assert "element #1 (image) was NOT rendered" in err, err
+        assert f"{FULL_BLEED_PICTURE_PCT:g}%" in err
+        assert _pictures(prs.slides[0]) == []
+        assert flattening_report(prs)["flattened"] is False
+        assert len(prs.slides[0].shapes) == 1, "the text box must survive"
+
+    def test_tiling_image_elements_are_trimmed_back_under_the_area_limit(self, capsys):
+        prs = self._build(
+            [
+                {"type": "text", "bbox": [0, 0, 300, 100], "content": "Title"},
+                {"type": "image", "bbox": [0, 0, 500, 500]},
+                {"type": "image", "bbox": [500, 0, 500, 500]},
+                {"type": "image", "bbox": [0, 500, 500, 500]},
+                {"type": "image", "bbox": [500, 500, 500, 500]},
+            ]
+        )
+        err = capsys.readouterr().err
+        assert "was NOT rendered" in err
+        assert f"{MAX_PICTURE_AREA_PCT:g}% limit" in err, err
+        report = flattening_report(prs)
+        assert report["flattened"] is False, report["violations"]
+        assert report["picture_count"] >= 1, "only the excess may be dropped"
+        assert report["slides"][0]["picture_area_pct"] <= MAX_PICTURE_AREA_PCT
+
+    def test_a_picture_only_slide_is_refused(self, capsys):
+        prs = self._build([{"type": "image", "bbox": [100, 100, 300, 300]}])
+        err = capsys.readouterr().err
+        assert "was NOT rendered" in err
+        assert "picture-only" in err or "nothing but picture" in err, err
+        assert _pictures(prs.slides[0]) == []
+        assert flattening_report(prs)["flattened"] is False
+
+    def test_a_legitimate_sub_image_is_kept(self, capsys):
+        prs = self._build(
+            [
+                {"type": "text", "bbox": [0, 0, 300, 100], "content": "Title"},
+                {"type": "image", "bbox": [600, 200, 300, 400],
+                 "description": "team photo"},
+            ]
+        )
+        assert capsys.readouterr().err == "", "a legitimate crop must be silent"
+        pictures = _pictures(prs.slides[0])
+        assert len(pictures) == 1
+        assert flattening_report(prs)["flattened"] is False
+
+    def test_at_exactly_the_area_limit_the_build_and_the_report_agree(self, capsys):
+        """The enforcer and the report evaluate ONE shared predicate each.
+
+        If they computed the rule separately they could disagree by a rounding
+        step at the boundary - and a deck would be written that its own report
+        calls flattened.
+        """
+        prs = self._build(
+            [
+                {"type": "text", "bbox": [0, 900, 300, 100], "content": "Title"},
+                {"type": "image", "bbox": [0, 0, 1000, 800]},
+            ]
+        )
+        assert capsys.readouterr().err == "", "80% is allowed, so nothing is dropped"
+        report = flattening_report(prs)
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(80.0, abs=0.2)
+        assert report["flattened"] is False
+        assert len(_pictures(prs.slides[0])) == 1
+
+    def test_just_over_the_area_limit_is_trimmed(self, capsys):
+        prs = self._build(
+            [
+                {"type": "text", "bbox": [0, 900, 300, 100], "content": "Title"},
+                {"type": "image", "bbox": [0, 0, 1000, 850]},
+            ]
+        )
+        assert "was NOT rendered" in capsys.readouterr().err
+        assert _pictures(prs.slides[0]) == []
+        assert flattening_report(prs)["flattened"] is False
+
+    def test_the_written_deck_is_never_flattened(self, tmp_path):
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "text", "bbox": [0, 0, 300, 100], "content": "Title"},
+                    {"type": "image", "bbox": [0, 0, 1000, 1000]},
+                ]
+            }
+        )
+        out = build_pptx(spec, tmp_path / "flat.pptx", _source_bytes())
+        reopened = Presentation(str(out))
+        assert flattening_report(reopened)["flattened"] is False
+        with zipfile.ZipFile(out) as zf:
+            assert [n for n in zf.namelist() if n.startswith("ppt/media/")] == []
+
+
+# ---------------------------------------------------------------------------
+# source_image threading
+# ---------------------------------------------------------------------------
+class TestSourceImageParameter:
+    """It is optional, positional-or-keyword, and takes bytes or a path."""
+
+    SPEC = {
+        "elements": [
+            {"type": "text", "bbox": [0, 0, 300, 100], "content": "Title"},
+            {"type": "image", "bbox": QUADRANT_BBOX["top_right"][:2] + [300, 300]},
+        ]
+    }
+
+    def _spec(self):
+        return SlideSpec.model_validate(self.SPEC)
+
+    def test_build_presentation_takes_it_positionally(self):
+        prs = build_presentation(self._spec(), _source_bytes())
+        assert len(_pictures(prs.slides[0])) == 1
+
+    def test_build_presentation_takes_it_as_a_keyword(self):
+        prs = build_presentation(self._spec(), source_image=_source_bytes())
+        assert len(_pictures(prs.slides[0])) == 1
+
+    def test_build_presentation_still_works_without_it(self, capsys):
+        prs = build_presentation(self._spec())
+        capsys.readouterr()
+        assert _pictures(prs.slides[0]) == []
+
+    def test_build_pptx_takes_bytes(self, tmp_path):
+        out = build_pptx(self._spec(), tmp_path / "bytes.pptx", _source_bytes())
+        assert len(_pictures(Presentation(str(out)).slides[0])) == 1
+
+    def test_build_pptx_takes_a_path_as_a_keyword(self, tmp_path):
+        out = build_pptx(
+            self._spec(), tmp_path / "path.pptx", source_image=_source_path(tmp_path)
+        )
+        assert len(_pictures(Presentation(str(out)).slides[0])) == 1
+
+    def test_build_pptx_still_works_without_it(self, tmp_path, capsys):
+        out = build_pptx(self._spec(), tmp_path / "none.pptx")
+        capsys.readouterr()
+        assert out.exists()
+
+
+# ---------------------------------------------------------------------------
 # build_presentation
 # ---------------------------------------------------------------------------
 class TestBuildPresentation:
@@ -775,6 +1717,24 @@ class TestBuildPresentation:
         captured = capsys.readouterr()
         assert captured.err.strip(), "a skipped element must be reported on stderr"
 
+    def test_a_broken_connector_is_isolated_like_any_other_element(self, capsys):
+        """A connector has NO bbox, so the isolation must not assume one."""
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "text", "bbox": [0, 0, 300, 100], "content": "keep me"},
+                    {"type": "connector", "start_point": [100, 100],
+                     "end_point": [500, 500]},
+                    {"type": "shape", "bbox": [0, 300, 200, 200]},
+                ]
+            }
+        )
+        _force(spec.elements[1], "start_point", None)
+        prs = build_presentation(spec)
+        err = capsys.readouterr().err
+        assert "skipped element #1 (connector)" in err, err
+        assert [_category(s) for s in prs.slides[0].shapes] == ["text", "shape"]
+
     def test_shape_elements_render_without_text(self):
         spec = mock_data.sample_spec()
         spec.background_color = None
@@ -828,8 +1788,15 @@ class TestBuildPptx:
         out = build_pptx(mock_data.sample_spec(), tmp_path / "deck.pptx")
         assert Presentation(str(out))._element.sldSz.get("type") == "screen16x9"
 
-    def test_reopened_deck_contains_no_picture_shapes(self, tmp_path):
-        """The whole point of the tool: native objects, not a flattened image."""
+    def test_a_spec_without_image_elements_embeds_no_picture_at_all(self, tmp_path):
+        """The whole point of the tool: native objects, not a flattened image.
+
+        A picture is only ever legitimate for an ``image`` element, and this spec
+        has none - so for THIS deck the old, absolute "zero pictures" assertion
+        is still exactly right, and it is kept in full. The general rule now
+        lives in :func:`flattening_report` (see :class:`TestFlatteningReport`),
+        because a genuine photo/chart region is a legitimate crop.
+        """
         out = build_pptx(mock_data.sample_spec(), tmp_path / "deck.pptx")
         prs = Presentation(str(out))
         slide = prs.slides[0]
@@ -844,6 +1811,41 @@ class TestBuildPptx:
         with zipfile.ZipFile(out) as zf:
             media = [n for n in zf.namelist() if n.startswith("ppt/media/")]
         assert media == [], f"package embeds image parts: {media}"
+
+    def test_the_reopened_deck_is_not_flattened(self, tmp_path):
+        """The replacement for "zero pictures": the shared flattening rule."""
+        out = build_pptx(mock_data.sample_spec(), tmp_path / "deck.pptx")
+        report = flattening_report(Presentation(str(out)))
+        assert report["flattened"] is False, report["violations"]
+        assert report["picture_count"] == 0
+        assert report["slides"][0]["native_count"] > 0
+
+    def test_a_deck_of_every_element_type_keeps_its_z_order(self, tmp_path):
+        """One of each: shape, connector, text, image, table - in spec order."""
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "shape", "kind": "arrow_right", "bbox": [0, 0, 200, 100]},
+                    {"type": "connector", "start_point": [200, 50],
+                     "end_point": [500, 50], "arrow_end": True},
+                    {"type": "text", "bbox": [0, 200, 400, 100], "content": "Flow"},
+                    {"type": "image", "bbox": [600, 100, 300, 300],
+                     "description": "team photo"},
+                    {"type": "table", "bbox": [0, 500, 500, 300],
+                     "data": [["a", "b"], ["c", "d"]]},
+                ]
+            }
+        )
+        out = build_pptx(spec, tmp_path / "everything.pptx", _source_bytes())
+        slide = Presentation(str(out)).slides[0]
+        assert [_category(s) for s in slide.shapes] == [
+            "shape",
+            "connector",
+            "text",
+            "image",
+            "table",
+        ]
+        assert flattening_report(Presentation(str(out)))["flattened"] is False
 
     def test_reopened_deck_still_has_native_editable_content(self, tmp_path):
         out = build_pptx(mock_data.sample_spec(), tmp_path / "deck.pptx")

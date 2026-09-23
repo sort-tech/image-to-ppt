@@ -608,7 +608,16 @@ function countsFromHeader(value: string | null): ElementCounts | null {
       const n = typeof raw === "number" ? raw : Number(raw);
       return Number.isFinite(n) ? n : 0;
     };
-    return { shape: read("shape"), table: read("table"), text: read("text") };
+    // Every `ElementType` is read explicitly (0 when the header omits it), so
+    // the returned object really is a complete `ElementCounts` rather than one
+    // that type-checks with keys missing at runtime.
+    return {
+      shape: read("shape"),
+      table: read("table"),
+      text: read("text"),
+      connector: read("connector"),
+      image: read("image"),
+    };
   } catch {
     return null;
   }

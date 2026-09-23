@@ -3,10 +3,12 @@ import { useEffect, useId, useMemo, useState } from "react";
 import { EyeOff, Maximize2, MonitorPlay, X } from "lucide-react";
 
 import type {
+  PreviewConnector,
+  PreviewImage,
   PreviewShape,
-  PreviewShapeItem,
   PreviewTable,
   PreviewText,
+  PreviewUnsupported,
   SlidePreview as SlidePreviewPayload,
 } from "../types/slide";
 
@@ -64,6 +66,54 @@ const DEFAULT_INK = "#000000";
  */
 const TABLE_RULE = "1px solid #000000";
 
+/**
+ * What a connector with `color: null` / `width_pt: null` really looks like.
+ *
+ * Those nulls do not mean "invisible" - a connector with no line is nothing at
+ * all. They mean the deck left the line to the theme: `add_connector` writes a
+ * `<p:style>` with `lnRef idx="2"` + `schemeClr accent1` and no `<a:ln>`, and
+ * the builder's template is python-pptx's own default (`Presentation()` with no
+ * argument), whose "Office" theme has accent1 `4F81BD` and a second
+ * `lnStyleLst` entry of `w="25400"` - 2pt. Read out of that template's
+ * theme1.xml, not guessed.
+ */
+const CONNECTOR_THEME_INK = "#4F81BD";
+const CONNECTOR_THEME_WIDTH_PT = 2;
+
+/** A hairline: PowerPoint draws a 0pt line as the thinnest it can, not as nothing. */
+const MIN_STROKE_PT = 0.25;
+
+/**
+ * PowerPoint's `prstDash="dash"` measured in line widths: 4 on, 3 off. Scaling
+ * the pattern by the stroke width is what keeps a thick dashed connector from
+ * reading as solid.
+ */
+const DASH_ON = 4;
+const DASH_OFF = 3;
+
+/**
+ * Arrowhead size, in stroke widths (`markerUnits="strokeWidth"`).
+ *
+ * OOXML's `w="med" len="med"` also scales with the line width, so a marker in
+ * stroke-width units tracks the deck instead of drifting on thick lines.
+ */
+const ARROW_SIZE = 4;
+
+/** The placeholder for an image whose crop the preview did not receive. */
+const IMAGE_PLACEHOLDER_FILL = "#F1F5F9";
+const PLACEHOLDER_STROKE = "#94A3B8";
+
+/**
+ * What may go into `<image href>`.
+ *
+ * `data_uri` is server-built, but it is also the one preview field that is fed
+ * straight to a URL-loading attribute, so only a base64 raster data URI is
+ * accepted. Anything else (an `http(s)` URL, an SVG document, a `javascript:`
+ * scheme, a truncated string) degrades to the labelled placeholder instead of
+ * being handed to the browser.
+ */
+const IMAGE_DATA_URI = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/;
+
 /* -------------------------------------------------------------------------- */
 /* Number plumbing                                                            */
 /* -------------------------------------------------------------------------- */
@@ -81,6 +131,16 @@ function fromPct(pct: unknown, span: number): number {
 /** SVG renders nothing for a negative width/height, so floor sizes at 0. */
 function size(pct: unknown, span: number): number {
   return Math.max(0, fromPct(pct, span));
+}
+
+/** The colour a connector is drawn with. Never "none" - see the constant. */
+function connectorStroke(connector: PreviewConnector): string {
+  return connector.color ?? CONNECTOR_THEME_INK;
+}
+
+/** The width a connector is drawn with, floored to a hairline. */
+function connectorWidth(connector: PreviewConnector): number {
+  return Math.max(MIN_STROKE_PT, num(connector.width_pt, CONNECTOR_THEME_WIDTH_PT));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -135,6 +195,200 @@ function AutoShapeNode({
       stroke={stroke}
       strokeWidth={strokeWidth}
     />
+  );
+}
+
+/**
+ * A diagram connector: a stroked line or one-bend path, with arrowheads.
+ *
+ * `markerId` is the id of the `<marker>` emitted for THIS connector's colour
+ * (see {@link SlideSvg}); a marker's `fill` does not follow the line's stroke,
+ * so one marker per colour is what keeps a red connector's arrowhead red.
+ */
+function ConnectorNode({
+  connector,
+  slideW,
+  slideH,
+  markerId,
+}: {
+  connector: PreviewConnector;
+  slideW: number;
+  slideH: number;
+  markerId: string | null;
+}) {
+  const x1 = fromPct(connector.start_pct?.x, slideW);
+  const y1 = fromPct(connector.start_pct?.y, slideH);
+  const x2 = fromPct(connector.end_pct?.x, slideW);
+  const y2 = fromPct(connector.end_pct?.y, slideH);
+
+  const stroke = connectorStroke(connector);
+  const strokeWidth = connectorWidth(connector);
+  // The dash pattern is in user units, so it has to be multiplied out of the
+  // line-width units PowerPoint measures `prstDash` in.
+  const dashArray =
+    connector.dash === "dashed"
+      ? `${DASH_ON * strokeWidth} ${DASH_OFF * strokeWidth}`
+      : undefined;
+
+  const arrow = markerId ? `url(#${markerId})` : undefined;
+  const markerStart = connector.arrow_start ? arrow : undefined;
+  const markerEnd = connector.arrow_end ? arrow : undefined;
+
+  const dx = Math.abs(x2 - x1);
+  const dy = Math.abs(y2 - y1);
+
+  if (dx === 0 && dy === 0) {
+    // A zero-length connector. SVG draws nothing for it - and a marker on a
+    // zero-length segment has no direction to orient to - so without this the
+    // element would be invisible, indistinguishable from one that was dropped.
+    // A dot is also roughly what PowerPoint shows for a collapsed connector.
+    return <circle cx={x1} cy={y1} r={Math.max(MIN_STROKE_PT, strokeWidth)} fill={stroke} />;
+  }
+
+  // An elbow whose endpoints share a row or a column has no bend to draw, and
+  // routing it as a path would leave a zero-length segment for `marker-end` to
+  // orient to. Draw it as the straight run it is.
+  if (connector.elbow && dx > 0 && dy > 0) {
+    // Two segments, per the preview contract. The deck's own `bentConnector3`
+    // routes in THREE - half the horizontal run, then the vertical, then the
+    // other half - so it both leaves and arrives horizontally, which two
+    // segments cannot both do. Putting the LONG leg last matches the arrival
+    // direction, and therefore the arrowhead's direction, in both layouts that
+    // actually occur: boxes side by side (long dx, arrives horizontally) and
+    // boxes stacked (long dy, where the preset's final horizontal leg is
+    // near-zero and it effectively arrives vertically too).
+    const d =
+      dx >= dy
+        ? `M ${x1} ${y1} L ${x1} ${y2} L ${x2} ${y2}`
+        : `M ${x1} ${y1} L ${x2} ${y1} L ${x2} ${y2}`;
+    return (
+      <path
+        d={d}
+        fill="none"
+        stroke={stroke}
+        strokeWidth={strokeWidth}
+        strokeDasharray={dashArray}
+        markerStart={markerStart}
+        markerEnd={markerEnd}
+      />
+    );
+  }
+
+  return (
+    <line
+      x1={x1}
+      y1={y1}
+      x2={x2}
+      y2={y2}
+      stroke={stroke}
+      strokeWidth={strokeWidth}
+      strokeDasharray={dashArray}
+      markerStart={markerStart}
+      markerEnd={markerEnd}
+    />
+  );
+}
+
+/**
+ * A cropped region of the source image, as it is embedded in the deck.
+ *
+ * `preserveAspectRatio="none"` is deliberate: the builder places the crop
+ * filling the bbox exactly, and the normalized grid scales x and y
+ * independently, so the picture in the .pptx really is stretched to the box.
+ * Letterboxing it here would show something the deck does not contain.
+ *
+ * `description` is model-supplied text and is rendered as a text node, so it
+ * can never be interpreted as markup.
+ */
+function ImageNode({
+  shape,
+  slideW,
+  slideH,
+}: {
+  shape: PreviewImage;
+  slideW: number;
+  slideH: number;
+}) {
+  const x = fromPct(shape.left_pct, slideW);
+  const y = fromPct(shape.top_pct, slideH);
+  const w = size(shape.width_pct, slideW);
+  const h = size(shape.height_pct, slideH);
+
+  const href =
+    typeof shape.data_uri === "string" && IMAGE_DATA_URI.test(shape.data_uri)
+      ? shape.data_uri
+      : null;
+  const description =
+    typeof shape.description === "string" ? shape.description.trim() : "";
+
+  if (href) {
+    return (
+      <image href={href} x={x} y={y} width={w} height={h} preserveAspectRatio="none">
+        {description ? <title>{description}</title> : null}
+      </image>
+    );
+  }
+
+  // No usable crop. The label has to say that the PREVIEW is missing it - not
+  // that the slide is - because this item was read off a picture shape and the
+  // server reports the reason as a warning. It also must not look like an
+  // empty box the analyzer invented.
+  //
+  // The label scales down (never up) with the box, so a small region shows
+  // smaller type instead of spilling text across the slide.
+  const scale = Math.min(1, w / 220, h / 96);
+  const titlePt = 12 * scale;
+  const roomy = scale > 0.45;
+
+  return (
+    <g>
+      <rect
+        x={x}
+        y={y}
+        width={w}
+        height={h}
+        fill={IMAGE_PLACEHOLDER_FILL}
+        stroke={PLACEHOLDER_STROKE}
+        strokeWidth={1}
+        strokeDasharray="4 3"
+      />
+      <foreignObject x={x} y={y} width={w} height={h} style={{ overflow: "hidden" }}>
+        <div
+          style={{
+            boxSizing: "border-box",
+            display: "flex",
+            height: "100%",
+            width: "100%",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: `${2 * scale}px`,
+            padding: `${6 * scale}px`,
+            fontFamily: PREVIEW_FONT,
+            lineHeight: 1.35,
+            textAlign: "center",
+            // Korean wraps on word boundaries, not mid-word, when asked to.
+            wordBreak: "keep-all",
+            overflow: "hidden",
+          }}
+        >
+          <span style={{ fontSize: `${titlePt}px`, fontWeight: 700, color: "#475569" }}>
+            이미지 미리보기 없음
+          </span>
+          {roomy ? (
+            <span style={{ fontSize: `${titlePt * 0.8}px`, color: "#64748B" }}>
+              잘라낸 이미지를 미리보기에 표시할 수 없습니다. 자세한 사유는 경고 목록에 기록되어
+              있습니다.
+            </span>
+          ) : null}
+          {roomy && description ? (
+            <span style={{ fontSize: `${titlePt * 0.8}px`, color: "#475569" }}>
+              “{description}”
+            </span>
+          ) : null}
+        </div>
+      </foreignObject>
+    </g>
   );
 }
 
@@ -294,7 +548,7 @@ function UnsupportedNode({
   slideW,
   slideH,
 }: {
-  shape: PreviewShapeItem;
+  shape: PreviewUnsupported;
   slideW: number;
   slideH: number;
 }) {
@@ -305,7 +559,7 @@ function UnsupportedNode({
       width={size(shape.width_pct, slideW)}
       height={size(shape.height_pct, slideH)}
       fill="none"
-      stroke="#94A3B8"
+      stroke={PLACEHOLDER_STROKE}
       strokeWidth={1}
       strokeDasharray="4 3"
     />
@@ -327,21 +581,57 @@ function SlideSvg({
 }) {
   // useId can contain ":" - legal in an id, but it keeps url(#...) readable to
   // strip it, and some tooling chokes on it.
-  const clipId = `slide-clip-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const clipId = `slide-clip-${uid}`;
 
   const slideW = Math.max(1, num(preview.slide?.width_pt, FALLBACK_W_PT));
   const slideH = Math.max(1, num(preview.slide?.height_pt, FALLBACK_H_PT));
   const shapes = Array.isArray(preview.shapes) ? preview.shapes : [];
 
+  /**
+   * One `<marker>` id per distinct connector colour.
+   *
+   * A marker is painted with its OWN fill, which defaults to black - it does
+   * not inherit the referencing line's stroke. One shared marker would
+   * therefore put black arrowheads on every coloured connector, which is the
+   * quiet bug this map exists to avoid. `fill="context-stroke"` is the other
+   * fix, and it was checked side by side with this one in a real Chromium
+   * build rather than assumed - both paint the arrowhead in the line's colour
+   * there. A marker per colour is what shipped because it needs no such
+   * support anywhere, and a slide only ever has a handful of connector
+   * colours.
+   */
+  const arrowMarkers = useMemo(() => {
+    const ids = new Map<string, string>();
+    for (const item of shapes) {
+      if (item.kind !== "connector") continue;
+      const stroke = connectorStroke(item);
+      if (!ids.has(stroke)) ids.set(stroke, `arrow-${uid}-${ids.size}`);
+    }
+    return ids;
+  }, [shapes, uid]);
+
   const label = useMemo(() => {
-    const tally = { shape: 0, text: 0, table: 0, other: 0 };
+    const tally = { shape: 0, text: 0, table: 0, connector: 0, image: 0, other: 0 };
     for (const item of shapes) {
       if (item.kind === "shape") tally.shape += 1;
       else if (item.kind === "text") tally.text += 1;
       else if (item.kind === "table") tally.table += 1;
+      else if (item.kind === "connector") tally.connector += 1;
+      else if (item.kind === "image") tally.image += 1;
       else tally.other += 1;
     }
-    return `슬라이드 미리보기 - 도형 ${tally.shape}개, 표 ${tally.table}개, 텍스트 상자 ${tally.text}개`;
+    // 연결선/이미지 are named only when the slide has some: reading out two
+    // zeroes on every plain slide would make the label longer without saying
+    // anything, and a category left out is not a category claimed to be empty.
+    const parts = [
+      `도형 ${tally.shape}개`,
+      `표 ${tally.table}개`,
+      `텍스트 상자 ${tally.text}개`,
+      ...(tally.connector > 0 ? [`연결선 ${tally.connector}개`] : []),
+      ...(tally.image > 0 ? [`이미지 ${tally.image}개`] : []),
+    ];
+    return `슬라이드 미리보기 - ${parts.join(", ")}`;
   }, [shapes]);
 
   return (
@@ -357,6 +647,25 @@ function SlideSvg({
         <clipPath id={clipId}>
           <rect x={0} y={0} width={slideW} height={slideH} />
         </clipPath>
+        {/* `orient="auto-start-reverse"` lets the same marker serve both ends:
+            at `marker-start` it is flipped, so the head points back out along
+            the line instead of into it. `markerUnits="strokeWidth"` matches
+            OOXML's `w="med" len="med"`, which also scales with line width. */}
+        {[...arrowMarkers].map(([color, id]) => (
+          <marker
+            key={id}
+            id={id}
+            viewBox="0 0 10 10"
+            refX={10}
+            refY={5}
+            markerWidth={ARROW_SIZE}
+            markerHeight={ARROW_SIZE}
+            markerUnits="strokeWidth"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" fill={color} />
+          </marker>
+        ))}
       </defs>
 
       {/* No background colour means a white slide, which is what PowerPoint shows. */}
@@ -383,6 +692,18 @@ function SlideSvg({
               return <TextNode key={index} shape={shape} slideW={slideW} slideH={slideH} />;
             case "table":
               return <TableNode key={index} shape={shape} slideW={slideW} slideH={slideH} />;
+            case "connector":
+              return (
+                <ConnectorNode
+                  key={index}
+                  connector={shape}
+                  slideW={slideW}
+                  slideH={slideH}
+                  markerId={arrowMarkers.get(connectorStroke(shape)) ?? null}
+                />
+              );
+            case "image":
+              return <ImageNode key={index} shape={shape} slideW={slideW} slideH={slideH} />;
             default:
               return (
                 <UnsupportedNode key={index} shape={shape} slideW={slideW} slideH={slideH} />
@@ -451,6 +772,14 @@ export default function SlidePreview({ preview, note = null }: SlidePreviewProps
     num(preview.slide?.height_pt, FALLBACK_H_PT),
   )}`;
 
+  // An elbow connector is the one thing on the slide the preview genuinely
+  // routes differently from PowerPoint (the payload reports the two endpoints,
+  // not the preset's bend offsets), so when there is one, the caption says so
+  // rather than letting the picture imply an exactness it does not have.
+  const hasElbow = (Array.isArray(preview.shapes) ? preview.shapes : []).some(
+    (shape) => shape.kind === "connector" && shape.elbow,
+  );
+
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -479,6 +808,12 @@ export default function SlidePreview({ preview, note = null }: SlidePreviewProps
         실제로 만들어진 PPTX의 도형·표·텍스트 상자를 그대로 읽어 그린 미리보기입니다. 다만 글꼴
         치수와 줄바꿈은 브라우저가 계산하므로 PowerPoint에서 열었을 때와 조금 다를 수 있습니다.
       </p>
+      {hasElbow ? (
+        <p className="mt-1 text-xs leading-relaxed text-slate-500 [word-break:keep-all]">
+          꺾인 연결선은 실제 경로를 두 구간으로 근사해 그립니다. 이어지는 두 점과 화살표가 붙는
+          쪽은 PPTX와 같습니다.
+        </p>
+      ) : null}
       {note ? <p className="mt-1 text-xs text-amber-300">{note}</p> : null}
 
       {zoomed ? (

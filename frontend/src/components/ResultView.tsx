@@ -2,9 +2,11 @@ import {
   TriangleAlert,
   Download,
   FileText,
+  ImageIcon,
   Info,
   Layers,
   LoaderCircle,
+  MoveRight,
   Shapes,
   Sparkles,
   Table2,
@@ -35,6 +37,12 @@ const BADGES: ReadonlyArray<{
   { key: "shape", label: "도형", icon: Shapes, tone: "text-sky-300 border-sky-500/30 bg-sky-500/10" },
   { key: "table", label: "표", icon: Table2, tone: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
   { key: "text", label: "텍스트 상자", icon: Type, tone: "text-emerald-300 border-emerald-500/30 bg-emerald-500/10" },
+  // 연결선 = a diagram connector (an arrow between boxes), 이미지 = a region
+  // cropped out of the source image. Neither borrows the amber of the
+  // 건너뛴 요소 panel or the rose of an error, so a count cannot read as a
+  // warning about itself.
+  { key: "connector", label: "연결선", icon: MoveRight, tone: "text-cyan-300 border-cyan-500/30 bg-cyan-500/10" },
+  { key: "image", label: "이미지", icon: ImageIcon, tone: "text-indigo-300 border-indigo-500/30 bg-indigo-500/10" },
 ];
 
 /**

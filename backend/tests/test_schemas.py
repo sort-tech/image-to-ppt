@@ -15,7 +15,10 @@ from pydantic import ValidationError
 from app import mock_data
 from app.schemas import (
     BBox,
+    ConnectorElement,
     ElementsAllDroppedError,
+    ImageElement,
+    Point,
     ShapeElement,
     SlideSpec,
     TableElement,
@@ -883,6 +886,493 @@ class TestDroppedStaysOutOfSerialization:
 
 
 # ---------------------------------------------------------------------------
+# Point: the connector's geometry, with BBox's tolerance and BBox's strictness
+# ---------------------------------------------------------------------------
+class TestPointCoercion:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            [120, 340],
+            (120, 340),
+            {"x": 120, "y": 340},
+            {"x": "120", "y": "340"},
+            {"x": 119.6, "y": 340.4},
+            [120.0, 340],
+            ["120px", "340px"],
+            {"left": 120, "top": 340},  # the same key aliases a bbox accepts
+        ],
+    )
+    def test_every_accepted_spelling_lands_on_the_same_point(self, raw):
+        assert Point.model_validate(raw).as_tuple() == (120, 340)
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ([-40, 20], (0, 20)),
+            ([20, -40], (20, 0)),
+            ([4000, 20], (1000, 20)),
+            ([20, 4000], (20, 1000)),
+            ([-1, 99999], (0, 1000)),
+        ],
+    )
+    def test_out_of_range_components_are_clamped_not_rejected(self, raw, expected):
+        assert Point.model_validate(raw).as_tuple() == expected
+
+    def test_a_longer_list_ignores_the_extra_items(self):
+        assert Point.model_validate([10, 20, 30, 40]).as_tuple() == (10, 20)
+
+    def test_extra_dict_keys_are_ignored(self):
+        assert Point.model_validate({"x": 1, "y": 2, "z": 3}).as_tuple() == (1, 2)
+
+    def test_an_already_built_point_passes_straight_through(self):
+        point = Point.model_validate([7, 8])
+        assert Point.model_validate(point).as_tuple() == (7, 8)
+
+    def test_a_validated_point_round_trips_through_its_own_dump(self):
+        point = Point.model_validate({"x": "12.5", "y": 900})
+        assert Point.model_validate(point.model_dump()).as_tuple() == point.as_tuple()
+
+    @pytest.mark.parametrize("raw", ["12,34", 12, None, object()])
+    def test_a_point_that_is_not_a_container_fails_cleanly(self, raw):
+        with pytest.raises(ValidationError):
+            Point.model_validate(raw)
+
+
+class TestIncompletePointIsRejected:
+    """A missing endpoint component may NOT be defaulted away.
+
+    Same reasoning as :class:`TestIncompleteBboxIsRejected`: defaulting a
+    missing ``y`` to 0 draws the connector to the top edge of the slide and
+    reports success. The element is dropped instead, and the reason names the
+    component so the user can see what the model got wrong.
+    """
+
+    CASES = {
+        "missing y in a list": ([5], "'y'"),
+        "missing y in a dict": ({"x": 5}, "'y'"),
+        "missing x in a dict": ({"y": 5}, "'x'"),
+        "null y": ({"x": 5, "y": None}, "'y'"),
+        "unparseable y": ({"x": 5, "y": "somewhere"}, "'y'"),
+        "empty dict": ({}, "'x', 'y'"),
+        "empty list": ([], "'x', 'y'"),
+    }
+
+    @pytest.mark.parametrize("label", list(CASES))
+    def test_the_point_itself_refuses_to_validate(self, label):
+        raw, _quoted = self.CASES[label]
+        with pytest.raises(ValidationError):
+            Point.model_validate(raw)
+
+    @pytest.mark.parametrize("label", list(CASES))
+    def test_the_element_is_dropped_and_the_reason_names_the_component(self, label):
+        raw, quoted = self.CASES[label]
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    _GOOD_TEXT,
+                    {"type": "connector", "start_point": raw, "end_point": [9, 9]},
+                ]
+            }
+        )
+        assert [el.type for el in spec.elements] == ["text"]
+        assert len(spec.dropped) == 1
+        reason = spec.dropped[0]
+        assert reason.startswith("element 1 (connector): start_point - ")
+        assert quoted in reason
+        assert "missing or unreadable" in reason
+
+    def test_the_documented_reason_wording_is_exact(self):
+        """The wording the contract quotes, for a connector's own endpoint."""
+        _kept, reasons = validate_elements(
+            [{"type": "connector", "start_point": {"x": 10}, "end_point": [9, 9]}]
+        )
+        assert reasons == [
+            "element 0 (connector): start_point - 'y' is missing or unreadable"
+        ]
+
+    def test_both_components_are_named_at_once(self):
+        _kept, reasons = validate_elements(
+            [{"type": "connector", "start_point": {}, "end_point": [9, 9]}]
+        )
+        assert reasons == [
+            "element 0 (connector): start_point - 'x', 'y' are missing or unreadable"
+        ]
+
+    def test_a_missing_endpoint_is_reported_as_a_missing_field(self):
+        _kept, reasons = validate_elements([{"type": "connector", "start_point": [1, 2]}])
+        assert reasons == ["element 0 (connector): end_point - Field required"]
+
+    def test_a_broken_connector_costs_only_itself(self):
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    _GOOD_SHAPE,
+                    {"type": "connector", "start_point": [1, 2], "end_point": ["x", 3]},
+                    _CONNECTOR,
+                ]
+            }
+        )
+        assert [el.type for el in spec.elements] == ["shape", "connector"]
+        assert len(spec.dropped) == 1
+
+    def test_a_slide_of_nothing_but_broken_connectors_is_a_loud_total_failure(self):
+        with pytest.raises(ValidationError) as excinfo:
+            SlideSpec.model_validate(
+                {
+                    "elements": [
+                        {"type": "connector", "start_point": [1, 2], "end_point": [3]},
+                        {"type": "connector", "start_point": {}, "end_point": [3, 4]},
+                    ]
+                }
+            )
+        reasons = all_dropped_reasons(excinfo.value)
+        assert reasons is not None and len(reasons) == 2
+        assert all("missing or unreadable" in reason for reason in reasons)
+
+
+# ---------------------------------------------------------------------------
+# ConnectorElement: the one element WITHOUT a bbox
+# ---------------------------------------------------------------------------
+class TestConnectorElement:
+    def test_defaults_match_the_contract(self):
+        el = ConnectorElement.model_validate(
+            {"type": "connector", "start_point": [10, 20], "end_point": [30, 40]}
+        )
+        assert el.kind == "straight"
+        assert el.start_point.as_tuple() == (10, 20)
+        assert el.end_point.as_tuple() == (30, 40)
+        assert el.arrow_start is False
+        assert el.arrow_end is True, "a one-way diagram arrow is the default"
+        assert el.dash_style == "solid"
+        assert el.color is None
+        assert el.width_pt is None, "the builder supplies the config default"
+
+    def test_a_connector_has_no_bbox_at_all(self):
+        el = ConnectorElement.model_validate(
+            {"type": "connector", "start_point": [1, 2], "end_point": [3, 4], "bbox": [0, 0, 9, 9]}
+        )
+        assert not hasattr(el, "bbox"), "a connector is defined by its endpoints"
+        assert "bbox" not in el.model_dump()
+
+    @pytest.mark.parametrize("kind", ["straight", "elbow"])
+    def test_every_connector_kind_literal_is_accepted(self, kind):
+        el = ConnectorElement.model_validate(
+            {"type": "connector", "start_point": [1, 2], "end_point": [3, 4], "kind": kind}
+        )
+        assert el.kind == kind
+
+    @pytest.mark.parametrize("dash", ["solid", "dashed"])
+    def test_every_dash_style_literal_is_accepted(self, dash):
+        el = ConnectorElement.model_validate(
+            {
+                "type": "connector",
+                "start_point": [1, 2],
+                "end_point": [3, 4],
+                "dash_style": dash,
+            }
+        )
+        assert el.dash_style == dash
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("Elbow", "elbow"),
+            ("right angle", "elbow"),
+            ("orthogonal", "elbow"),
+            ("line", "straight"),
+            (None, "straight"),
+        ],
+    )
+    def test_connector_kind_aliases_are_understood(self, raw, expected):
+        el = ConnectorElement.model_validate(
+            {"type": "connector", "start_point": [1, 2], "end_point": [3, 4], "kind": raw}
+        )
+        assert el.kind == expected
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [("dotted", "dashed"), ("DASH", "dashed"), ("continuous", "solid"), (None, "solid")],
+    )
+    def test_dash_style_aliases_are_understood(self, raw, expected):
+        el = ConnectorElement.model_validate(
+            {
+                "type": "connector",
+                "start_point": [1, 2],
+                "end_point": [3, 4],
+                "dash_style": raw,
+            }
+        )
+        assert el.dash_style == expected
+
+    def test_a_bogus_kind_never_survives_as_a_bogus_value(self):
+        """``CONNECTOR_MAP`` only knows two literals, so nothing else may reach it."""
+        try:
+            el = ConnectorElement.model_validate(
+                {
+                    "type": "connector",
+                    "start_point": [1, 2],
+                    "end_point": [3, 4],
+                    "kind": "spiral",
+                }
+            )
+        except ValidationError:
+            return
+        assert el.kind in {"straight", "elbow"}
+
+    def test_a_bogus_dash_style_never_survives_as_a_bogus_value(self):
+        try:
+            el = ConnectorElement.model_validate(
+                {
+                    "type": "connector",
+                    "start_point": [1, 2],
+                    "end_point": [3, 4],
+                    "dash_style": "zigzag",
+                }
+            )
+        except ValidationError:
+            return
+        assert el.dash_style in {"solid", "dashed"}
+
+    @pytest.mark.parametrize(
+        "raw, start, end",
+        [
+            ("yes", True, True),
+            ("no", False, False),
+            (1, True, True),
+            (0, False, False),
+            (None, False, True),  # absent-ish: each field keeps its own default
+        ],
+    )
+    def test_arrow_flags_coerce_like_every_other_bool(self, raw, start, end):
+        el = ConnectorElement.model_validate(
+            {
+                "type": "connector",
+                "start_point": [1, 2],
+                "end_point": [3, 4],
+                "arrow_start": raw,
+                "arrow_end": raw,
+            }
+        )
+        assert (el.arrow_start, el.arrow_end) == (start, end)
+
+    def test_colour_and_width_degrade_instead_of_raising(self):
+        el = ConnectorElement.model_validate(
+            {
+                "type": "connector",
+                "start_point": [1, 2],
+                "end_point": [3, 4],
+                "color": "not a colour",
+                "width_pt": "nonsense",
+            }
+        )
+        assert el.color is None and el.width_pt is None
+
+    def test_a_good_colour_and_width_are_normalized(self):
+        el = ConnectorElement.model_validate(
+            {
+                "type": "connector",
+                "start_point": [1, 2],
+                "end_point": [3, 4],
+                "color": "1e3a6e",
+                "width_pt": "2.5",
+            }
+        )
+        assert el.color == "#1E3A6E" and el.width_pt == 2.5
+
+
+# ---------------------------------------------------------------------------
+# block-arrow shape kinds
+# ---------------------------------------------------------------------------
+class TestBlockArrowShapeKinds:
+    @pytest.mark.parametrize(
+        "kind", ["arrow_right", "arrow_left", "arrow_up", "arrow_down"]
+    )
+    def test_every_block_arrow_literal_is_accepted(self, kind):
+        el = ShapeElement.model_validate({"type": "shape", "bbox": [0, 0, 10, 10], "kind": kind})
+        assert el.kind == kind
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("right_arrow", "arrow_right"),
+            ("Arrow-Right", "arrow_right"),
+            ("arrow right", "arrow_right"),
+            ("arrow", "arrow_right"),
+            ("left arrow", "arrow_left"),
+            ("UPARROW", "arrow_up"),
+            ("block_arrow_down", "arrow_down"),
+        ],
+    )
+    def test_arrow_aliases_land_on_a_real_literal(self, raw, expected):
+        el = ShapeElement.model_validate({"type": "shape", "bbox": [0, 0, 10, 10], "kind": raw})
+        assert el.kind == expected
+
+    def test_a_bogus_kind_still_never_survives(self):
+        el = ShapeElement.model_validate(
+            {"type": "shape", "bbox": [0, 0, 10, 10], "kind": "trapezoid"}
+        )
+        assert el.kind in {
+            "rectangle",
+            "rounded_rectangle",
+            "circle",
+            "arrow_right",
+            "arrow_left",
+            "arrow_up",
+            "arrow_down",
+        }
+
+
+# ---------------------------------------------------------------------------
+# ImageElement
+# ---------------------------------------------------------------------------
+class TestImageElement:
+    def test_an_image_with_a_description(self):
+        el = ImageElement.model_validate(
+            {"type": "image", "bbox": [600, 200, 300, 400], "description": "team photo"}
+        )
+        assert el.bbox.as_tuple() == (600, 200, 300, 400)
+        assert el.description == "team photo"
+
+    def test_an_image_without_a_description(self):
+        el = ImageElement.model_validate({"type": "image", "bbox": [0, 0, 100, 100]})
+        assert el.description is None
+
+    @pytest.mark.parametrize("raw", [None, "", "   ", "\n"])
+    def test_a_blank_description_normalizes_to_none(self, raw):
+        el = ImageElement.model_validate(
+            {"type": "image", "bbox": [0, 0, 1, 1], "description": raw}
+        )
+        assert el.description is None, "nothing should have to render an empty caption"
+
+    def test_a_non_string_description_is_coerced_not_fatal(self):
+        el = ImageElement.model_validate(
+            {"type": "image", "bbox": [0, 0, 1, 1], "description": 42}
+        )
+        assert el.description == "42"
+
+    def test_an_image_still_needs_a_readable_bbox(self):
+        """It IS a box element - the crop region is the bbox, so it is required."""
+        _kept, reasons = validate_elements([{"type": "image", "bbox": {"x": 1, "y": 2, "w": 3}}])
+        assert reasons == ["element 0 (image): bbox - 'h' is missing or unreadable"]
+
+
+# ---------------------------------------------------------------------------
+# the union, the counts and the bare-array recovery, WITH the bbox-less type
+# ---------------------------------------------------------------------------
+_CONNECTOR = {
+    "type": "connector",
+    "start_point": [120, 300],
+    "end_point": [480, 300],
+    "arrow_end": True,
+}
+_IMAGE = {"type": "image", "bbox": [600, 200, 300, 400], "description": "team photo"}
+
+
+class TestTheUnionCarriesTheNewTypes:
+    def test_the_discriminated_union_dispatches_on_every_type(self):
+        spec = SlideSpec.model_validate(
+            {"elements": [_GOOD_SHAPE, _TABLE_EL, _GOOD_TEXT, _CONNECTOR, _IMAGE]}
+        )
+        assert [type(el) for el in spec.elements] == [
+            ShapeElement,
+            TableElement,
+            TextElement,
+            ConnectorElement,
+            ImageElement,
+        ]
+
+    @pytest.mark.parametrize("bogus", ["video", "hologram", "picture", "line"])
+    def test_a_bogus_type_is_still_dropped_with_a_reason(self, bogus):
+        spec = SlideSpec.model_validate(
+            {"elements": [_CONNECTOR, {"type": bogus, "bbox": [0, 0, 1, 1]}]}
+        )
+        assert [el.type for el in spec.elements] == ["connector"]
+        assert len(spec.dropped) == 1 and bogus in spec.dropped[0]
+
+    def test_counts_by_type_counts_the_new_types(self):
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    _GOOD_SHAPE,
+                    _CONNECTOR,
+                    dict(_CONNECTOR, kind="elbow"),
+                    _IMAGE,
+                    _GOOD_TEXT,
+                ]
+            }
+        )
+        assert spec.counts_by_type() == {
+            "shape": 1,
+            "connector": 2,
+            "image": 1,
+            "text": 1,
+        }
+
+    def test_z_order_is_still_plain_input_order(self):
+        spec = SlideSpec.model_validate({"elements": [_CONNECTOR, _IMAGE, _GOOD_TEXT]})
+        assert [el.type for el in spec.elements] == ["connector", "image", "text"]
+
+    def test_a_saved_spec_round_trips_through_its_own_dump(self):
+        """``--save-json`` writes ``model_dump``; ``--from-json`` reads it back.
+
+        The dumped endpoints are ``{"x": ..., "y": ...}`` objects, so
+        :class:`Point` has to accept its own output or every rebuild from a
+        saved spec would lose the connectors.
+        """
+        spec = SlideSpec.model_validate({"elements": [_CONNECTOR, _IMAGE, _GOOD_TEXT]})
+        again = SlideSpec.model_validate(json.loads(spec.model_dump_json()))
+        assert again.model_dump() == spec.model_dump()
+        assert again.dropped == []
+
+
+class TestABareArrayOfConnectorsIsStillRecovered:
+    """``_looks_like_element`` used to require ``"bbox" in value``.
+
+    A connector has ``start_point``/``end_point`` and no bbox at all, so that
+    rule made a bare top-level array of connectors unrecognizable: the payload
+    fell through as a non-spec, ``SlideSpec`` saw a bare ``list``, and every
+    element AND every per-element reason was lost.
+    """
+
+    def test_a_bare_array_of_connectors_becomes_a_spec(self):
+        payload = [_CONNECTOR, dict(_CONNECTOR, kind="elbow")]
+        assert normalize_spec_payload(payload) == {"elements": payload}
+
+    def test_it_then_validates_into_both_connectors(self):
+        spec = SlideSpec.model_validate(normalize_spec_payload([_CONNECTOR, _IMAGE]))
+        assert [el.type for el in spec.elements] == ["connector", "image"]
+        assert spec.dropped == []
+
+    def test_a_typeless_connector_is_recognized_by_its_endpoints(self):
+        """No ``type`` key at all: it must still be seen as an ELEMENT array, so
+        the failure is a per-element reason instead of a lost payload."""
+        payload = [{"start_point": [1, 2], "end_point": [3, 4]}]
+        assert normalize_spec_payload(payload) == {"elements": payload}
+        spec_payload = normalize_spec_payload(payload)
+        with pytest.raises(ValidationError) as excinfo:
+            SlideSpec.model_validate(spec_payload)
+        reasons = all_dropped_reasons(excinfo.value)
+        assert reasons is not None and len(reasons) == 1
+
+    def test_a_half_broken_connector_is_recognized_too(self):
+        payload = [{"start_point": [1, 2], "arrow_end": True}]
+        assert normalize_spec_payload(payload) == {"elements": payload}
+
+    def test_a_connector_under_an_envelope_key_is_recovered(self):
+        assert normalize_spec_payload({"result": [_CONNECTOR]}) == {"elements": [_CONNECTOR]}
+
+    def test_one_connector_rescues_an_array_with_a_junk_neighbour(self):
+        payload = [_CONNECTOR, "notes"]
+        assert normalize_spec_payload(payload) == {"elements": payload}
+        spec = SlideSpec.model_validate(normalize_spec_payload(payload))
+        assert [el.type for el in spec.elements] == ["connector"]
+        assert len(spec.dropped) == 1
+
+    def test_a_list_that_is_clearly_not_elements_is_still_a_bad_spec(self):
+        assert normalize_spec_payload([1, 2, 3]) == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
 # llm_json_schema
 # ---------------------------------------------------------------------------
 def test_llm_json_schema_is_unchanged_by_the_dropped_field():
@@ -892,7 +1382,13 @@ def test_llm_json_schema_is_unchanged_by_the_dropped_field():
     assert set(schema["properties"]) == {"background_color", "elements"}
     assert schema["required"] == ["elements"]
     variants = schema["properties"]["elements"]["items"]["oneOf"]
-    assert [variant["title"] for variant in variants] == ["shape", "table", "text"]
+    assert [variant["title"] for variant in variants] == [
+        "shape",
+        "table",
+        "text",
+        "connector",
+        "image",
+    ]
     assert variants[1]["required"] == ["type", "bbox", "data"]
 
 
@@ -900,8 +1396,69 @@ def test_llm_json_schema_is_a_serializable_dict_describing_the_contract():
     schema = llm_json_schema()
     assert isinstance(schema, dict) and schema
     blob = json.dumps(schema).lower()
-    for token in ("shape", "table", "text", "bbox", "elements"):
+    for token in (
+        "shape",
+        "table",
+        "text",
+        "bbox",
+        "elements",
+        "connector",
+        "image",
+        "start_point",
+        "end_point",
+        "arrow_end",
+        "dash_style",
+        "elbow",
+        "arrow_right",
+    ):
         assert token in blob, f"{token!r} missing from llm_json_schema()"
+
+
+class TestLlmJsonSchemaDescribesTheNewTypes:
+    def _variant(self, title: str) -> dict:
+        return next(
+            entry
+            for entry in llm_json_schema()["properties"]["elements"]["items"]["oneOf"]
+            if entry["title"] == title
+        )
+
+    def test_the_connector_variant_matches_the_model(self):
+        variant = self._variant("connector")
+        assert variant["required"] == ["type", "start_point", "end_point"]
+        assert "bbox" not in variant["properties"], "a connector has no bbox"
+        assert set(variant["properties"]) == set(ConnectorElement.model_fields)
+        assert variant["properties"]["kind"]["enum"] == ["straight", "elbow"]
+        assert variant["properties"]["dash_style"]["enum"] == ["solid", "dashed"]
+        assert variant["properties"]["arrow_end"]["default"] is True
+        assert variant["properties"]["arrow_start"]["default"] is False
+
+    def test_the_image_variant_matches_the_model(self):
+        variant = self._variant("image")
+        assert variant["required"] == ["type", "bbox"]
+        assert set(variant["properties"]) == set(ImageElement.model_fields)
+
+    def test_the_image_variant_warns_against_flattening(self):
+        blob = json.dumps(self._variant("image")).lower()
+        assert "whole slide" in blob
+        for word in ("box", "text", "table"):
+            assert word in blob, "it must say what an image is NOT for"
+
+    def test_the_shape_variant_advertises_every_block_arrow(self):
+        enum = self._variant("shape")["properties"]["kind"]["enum"]
+        assert enum == [
+            "rectangle",
+            "rounded_rectangle",
+            "circle",
+            "arrow_right",
+            "arrow_left",
+            "arrow_up",
+            "arrow_down",
+        ]
+
+    def test_the_coordinate_note_explains_the_bbox_less_element(self):
+        note = llm_json_schema()["coordinate_system"].lower()
+        assert "start_point" in note and "end_point" in note
+        assert "no bbox" in note
 
 
 # ---------------------------------------------------------------------------

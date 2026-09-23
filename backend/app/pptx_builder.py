@@ -1,61 +1,114 @@
 """Render a :class:`schemas.SlideSpec` into a real, native PowerPoint deck.
 
-Everything this module emits is a genuine, editable PowerPoint object: auto shapes,
-graphic-frame tables and text boxes. No part of the input image is ever embedded as a
-picture, so the resulting deck contains zero picture shapes.
+Almost everything this module emits is a genuine, editable PowerPoint object: auto
+shapes, block arrows, connectors, graphic-frame tables and text boxes. The ONE
+exception is an ``image`` element: a region the analyzer could not express as any of
+those (a photo, a rendered chart, a logo) is cropped out of the source image and
+placed with ``add_picture``, because a wrong native approximation of a photograph is
+worse than the photograph. That is a deliberate, bounded exception, and
+:func:`flattening_report` is the fence around it: a picture may not cover the slide,
+pictures may not tile it, and a picture-only slide is rejected outright. Pasting the
+input image onto a slide remains the one thing this tool exists NOT to do.
 
 Design notes
 ------------
 * Coordinates arrive as integers in ``0..config.COORD_SCALE`` on both axes and are
-  mapped linearly onto the 16:9 slide (13.333in x 7.5in) by :func:`scale_bbox`.
+  mapped linearly onto the 16:9 slide (13.333in x 7.5in) by :func:`scale_bbox`
+  (boxes) and :func:`scale_point` (connector endpoints).
 * ``spec.elements`` order *is* the z-order: earlier elements are drawn first and later
   elements paint on top.
 * Robustness is a hard requirement: a single malformed element (or colour) must never
   abort the whole build. :func:`build_presentation` isolates every element, reports the
   failure on stderr and carries on with the rest.
 
-Verified against python-pptx 1.0.2 (``GraphicFrame.shadow`` raises
-``NotImplementedError`` there, hence the guarded shadow helper).
+Verified against python-pptx 1.0.2:
+
+* ``GraphicFrame.shadow`` raises ``NotImplementedError``, hence the guarded shadow
+  helper;
+* ``LineFormat`` exposes only ``color``, ``dash_style``, ``fill`` and ``width`` -
+  there is NO arrowhead API anywhere (not on ``line``, not on the connector), so
+  arrowheads are written as the schema's own ``a:headEnd``/``a:tailEnd`` children;
+* a connector reports ``MSO_SHAPE_TYPE.LINE``; there is no ``CONNECTOR`` member.
 """
 
 from __future__ import annotations
 
+import io
 import re
 import sys
 from pathlib import Path
+from typing import Any, Union
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.dml import MSO_LINE_DASH_STYLE
+from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE, MSO_SHAPE_TYPE
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Emu, Inches, Pt
 
 from . import config
-from .schemas import BBox, ShapeElement, SlideSpec, TableElement, TextElement
+from .schemas import (
+    BBox,
+    ConnectorElement,
+    ImageElement,
+    Point,
+    ShapeElement,
+    SlideSpec,
+    TableElement,
+    TextElement,
+)
 
 __all__ = [
     "PptxBuildError",
+    "PictureSourceError",
     "SHAPE_MAP",
     "ALIGN_MAP",
+    "CONNECTOR_MAP",
+    "DASH_MAP",
+    "ARROW_HEAD_TYPE",
     "MIN_DIMENSION_IN",
     "SLIDE_SIZE_TYPE_16X9",
     "SLIDE_SIZE_TYPE_CUSTOM",
     "PLAIN_TABLE_STYLE_ID",
     "TABLE_FONT_DARK",
     "TABLE_FONT_LIGHT",
+    "FULL_BLEED_PICTURE_PCT",
+    "MAX_PICTURE_AREA_PCT",
+    "SourceImage",
     "to_rgb",
     "scale_bbox",
+    "scale_point",
     "add_shape",
     "add_table",
     "add_textbox",
+    "add_connector",
+    "add_picture",
+    "flattening_report",
     "build_presentation",
     "build_pptx",
 ]
 
+#: What :func:`add_picture` and :func:`build_presentation` accept as the original
+#: image to crop from: the raw bytes (what the HTTP layer holds), a path (what the
+#: CLI holds), or an already-decoded ``PIL.Image.Image`` (what a build reuses across
+#: several image elements). ``None`` means "there is no source image", which is the
+#: normal state of ``/api/preview``, ``/api/build-from-json`` and ``--from-json``.
+SourceImage = Union[bytes, bytearray, memoryview, str, Path, Any]
+
 
 class PptxBuildError(Exception):
     """Raised when a deck (or a single element of it) cannot be rendered."""
+
+
+class PictureSourceError(PptxBuildError):
+    """The crop behind an ``image`` element could not be produced.
+
+    Raised by :func:`add_picture` when there is no source image at all, when the
+    source cannot be decoded, or when the crop itself fails. It travels through the
+    per-element render isolation in :func:`build_presentation` like any other
+    element failure, so one unusable image never costs the rest of the slide.
+    """
 
 
 #: Schema shape kind -> python-pptx auto-shape preset.
@@ -63,6 +116,27 @@ SHAPE_MAP: dict[str, MSO_SHAPE] = {
     "rectangle": MSO_SHAPE.RECTANGLE,
     "rounded_rectangle": MSO_SHAPE.ROUNDED_RECTANGLE,
     "circle": MSO_SHAPE.OVAL,
+    # Block arrows: real auto shapes with text frames and handles, not connectors.
+    "arrow_right": MSO_SHAPE.RIGHT_ARROW,
+    "arrow_left": MSO_SHAPE.LEFT_ARROW,
+    "arrow_up": MSO_SHAPE.UP_ARROW,
+    "arrow_down": MSO_SHAPE.DOWN_ARROW,
+}
+
+#: Schema connector kind -> python-pptx connector preset. ``ELBOW`` is the
+#: orthogonal two-segment route an architecture diagram uses between boxes that do
+#: not line up.
+CONNECTOR_MAP: dict[str, MSO_CONNECTOR] = {
+    "straight": MSO_CONNECTOR.STRAIGHT,
+    "elbow": MSO_CONNECTOR.ELBOW,
+}
+
+#: Schema dash style -> DrawingML preset dash. Written EXPLICITLY in both
+#: directions (never left to inherit) so the built deck - which is what the
+#: preview reads back - states what the spec asked for.
+DASH_MAP: dict[str, MSO_LINE_DASH_STYLE] = {
+    "solid": MSO_LINE_DASH_STYLE.SOLID,
+    "dashed": MSO_LINE_DASH_STYLE.DASH,
 }
 
 #: Schema alignment -> python-pptx paragraph alignment.
@@ -119,6 +193,28 @@ _SURROGATES_RE = re.compile("[\ud800-\udfff]")
 #: What an unencodable character becomes: U+FFFD REPLACEMENT CHARACTER, the
 #: standard "there was a character here that could not be represented" glyph.
 UNENCODABLE_REPLACEMENT: str = "�"
+
+#: ``ST_LineEndType`` / ``ST_LineEndWidth`` / ``ST_LineEndLength`` values for the
+#: ``a:headEnd``/``a:tailEnd`` arrowheads. python-pptx has no arrowhead API at all
+#: (verified on 1.0.2: ``LineFormat`` offers only colour, dash style, fill and
+#: width), so :func:`_set_arrow_heads` writes these attributes itself.
+ARROW_HEAD_TYPE: str = "triangle"
+ARROW_HEAD_SIZE: str = "med"
+
+#: Anti-flattening rule 1: a picture this large on BOTH axes is a screenshot of the
+#: slide, not an illustration on it.
+FULL_BLEED_PICTURE_PCT: float = 95.0
+
+#: Anti-flattening rule 2: the share of the slide all pictures together may cover.
+MAX_PICTURE_AREA_PCT: float = 80.0
+
+#: Percentage comparisons in :func:`flattening_report` ignore float noise below this.
+_PCT_EPS: float = 1e-9
+
+#: The "there should have been an image here" outline: a thin dashed grey rectangle,
+#: deliberately quiet enough not to be mistaken for slide content.
+PLACEHOLDER_LINE_COLOR: RGBColor = RGBColor(0xB0, 0xB0, 0xB0)
+PLACEHOLDER_LINE_WIDTH_PT: float = 0.75
 
 
 # --------------------------------------------------------------------------- #
@@ -324,6 +420,39 @@ def scale_bbox(bbox: BBox) -> tuple[Emu, Emu, Emu, Emu]:
     )
 
 
+def scale_point(p: Point) -> tuple[Emu, Emu]:
+    """Map one normalized connector endpoint onto slide EMU coordinates.
+
+    Returns ``(x, y)``, scaled exactly like :func:`scale_bbox` does - x by the
+    slide WIDTH, y by the slide HEIGHT - so a connector lands on the same grid as
+    the boxes it joins.
+
+    There is no minimum size and no clipping to apply to a single point: a point has
+    no extent, and :class:`schemas.Point` already clamps both components to
+    ``0..COORD_SCALE``. The clamp here is belt and braces for a value written
+    straight onto the model, and it reports itself if it ever has to move
+    something, because a moved endpoint is not the geometry the spec asked for.
+
+    A component that cannot be read as a number raises, exactly as an unusable
+    ``bbox`` does in :func:`scale_bbox`; the per-element isolation in
+    :func:`build_presentation` then skips that one connector with a reason.
+    """
+    scale = float(config.COORD_SCALE) or 1000.0
+    x_in = float(p.x) / scale * float(config.SLIDE_WIDTH_IN)
+    y_in = float(p.y) / scale * float(config.SLIDE_HEIGHT_IN)
+
+    fitted_x = min(max(x_in, 0.0), float(config.SLIDE_WIDTH_IN))
+    fitted_y = min(max(y_in, 0.0), float(config.SLIDE_HEIGHT_IN))
+    if abs(fitted_x - x_in) > _GEOM_EPS_IN or abs(fitted_y - y_in) > _GEOM_EPS_IN:
+        _warn(
+            f"connector point ({p.x}, {p.y}) lies outside the "
+            f"{config.SLIDE_WIDTH_IN:g}x{config.SLIDE_HEIGHT_IN:g}in slide; moved it "
+            "back onto the edge. The rendered endpoint is NOT where the spec put it."
+        )
+
+    return _emu_in(fitted_x), _emu_in(fitted_y)
+
+
 def _slide_size_element(prs):
     """The ``<p:sldSz>`` lxml element of *prs*, or ``None`` if it cannot be reached.
 
@@ -379,6 +508,28 @@ def _disable_shadow(shape) -> None:
     try:
         shape.shadow.inherit = False
     except (NotImplementedError, AttributeError, ValueError):
+        pass
+
+
+def _set_alt_text(shape, text: str | None) -> None:
+    """Record *text* as the shape's alt text (``<p:cNvPr descr>``).
+
+    This is what carries an ``image`` element's ``description`` INTO the deck, and
+    it is load-bearing rather than cosmetic: ``services.preview`` derives its
+    payload from the built deck and reads the description back off the picture's
+    alt text, so a description that is never written here is one the preview can
+    only ever report as ``null``. It is also the accessibility field PowerPoint
+    itself shows, which is where a "team photo" label belongs anyway.
+
+    Best-effort, like every other cosmetic write here: a description is never
+    worth losing the picture over.
+    """
+    label = (text or "").strip()
+    if not label:
+        return
+    try:
+        shape._element._nvXxPr.cNvPr.set("descr", label)
+    except Exception:  # noqa: BLE001 - alt text may never break a build
         pass
 
 
@@ -618,6 +769,565 @@ def add_textbox(slide, el: TextElement):
     return textbox
 
 
+def _set_arrow_heads(shape, *, start: bool, end: bool) -> None:
+    """Write the DrawingML arrowheads onto the shape's ``a:ln`` - as raw XML.
+
+    This is raw lxml on purpose, not for lack of looking: python-pptx 1.0.2 has no
+    arrowhead API anywhere. ``LineFormat`` exposes ``color``, ``dash_style``,
+    ``fill`` and ``width`` and nothing else, and ``begin_arrow_head`` /
+    ``end_arrow_head`` exist neither on the connector nor on its ``.line``. The
+    only way an arrowhead reaches the package is the schema's own children of
+    ``a:ln``, which is what this writes; it survives a save/reload unchanged.
+
+    ``a:headEnd`` is the arrowhead at the line's BEGIN point, ``a:tailEnd`` the one
+    at its END point - so ``arrow_start`` -> ``headEnd`` and ``arrow_end`` ->
+    ``tailEnd``. ``CT_LineProperties`` orders its children
+    ``[fill, prstDash, ..., headEnd, tailEnd]``: the caller therefore sets colour,
+    width and dash style FIRST and these are appended LAST, in that order, so the
+    saved XML is schema-valid. Both children are removed before being re-added, so
+    the file says exactly what the element asked for rather than accumulating.
+    """
+    ln = shape.line._get_or_add_ln()
+    for tag, wanted in ((qn("a:headEnd"), start), (qn("a:tailEnd"), end)):
+        for existing in ln.findall(tag):
+            ln.remove(existing)
+        if not wanted:
+            continue
+        element = ln.makeelement(tag, {})
+        element.set("type", ARROW_HEAD_TYPE)
+        element.set("w", ARROW_HEAD_SIZE)
+        element.set("len", ARROW_HEAD_SIZE)
+        ln.append(element)
+
+
+def add_connector(slide, el: ConnectorElement):
+    """Draw a native diagram connector between two points.
+
+    A connector has no bbox: it is defined by its two endpoints, and PowerPoint
+    keeps it editable as a line (and re-routes an elbow itself when its ends move).
+
+    Unlike a shape's outline, a connector with no colour is NOT invisible: no
+    explicit colour means the theme's line colour, because a line nobody can see is
+    never what "connector" meant. Width falls back to
+    ``config.DEFAULT_BORDER_WIDTH_PT`` the same way a shape border does.
+    """
+    kind = getattr(el, "kind", "straight")
+    preset = CONNECTOR_MAP.get(kind, MSO_CONNECTOR.STRAIGHT)
+
+    begin_x, begin_y = scale_point(el.start_point)
+    end_x, end_y = scale_point(el.end_point)
+
+    connector = slide.shapes.add_connector(preset, begin_x, begin_y, end_x, end_y)
+    _disable_shadow(connector)
+
+    line = connector.line
+    # Colour / width / dash FIRST, arrowheads LAST: see _set_arrow_heads.
+    line_rgb = to_rgb(getattr(el, "color", None))
+    if line_rgb is not None:
+        line.color.rgb = line_rgb
+    line.width = Pt(_positive(getattr(el, "width_pt", None), config.DEFAULT_BORDER_WIDTH_PT))
+    line.dash_style = DASH_MAP.get(getattr(el, "dash_style", "solid"), MSO_LINE_DASH_STYLE.SOLID)
+
+    _set_arrow_heads(
+        connector,
+        start=bool(getattr(el, "arrow_start", False)),
+        end=bool(getattr(el, "arrow_end", True)),
+    )
+    return connector
+
+
+# --------------------------------------------------------------------------- #
+# Sub-images: the one region kind that is cropped out of the source image
+# --------------------------------------------------------------------------- #
+
+
+def _decode_source_image(source: SourceImage):
+    """Decode *source* into a PIL image, or raise :class:`PictureSourceError`.
+
+    Accepts raw bytes (the HTTP layer), a path (the CLI) or an already-decoded PIL
+    image (a build that places several crops). Pillow is imported lazily and every
+    failure - a missing Pillow, a missing file, a truncated or undecodable image -
+    becomes one ``PictureSourceError``, so an unusable source costs the image
+    element and nothing else.
+    """
+    if source is None:
+        raise PictureSourceError(
+            "there is no source image to crop from, so nothing could be embedded. An "
+            "image element can only be rendered by the conversion that still has the "
+            "original image - re-run the conversion instead of rebuilding the deck "
+            "from a saved spec."
+        )
+
+    # An already-decoded PIL image: used as-is (decoded once per build, not per
+    # element). Duck-typed so nothing here needs Pillow imported at module scope.
+    if hasattr(source, "crop") and hasattr(source, "size"):
+        return source
+
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - Pillow ships with python-pptx
+        raise PictureSourceError(
+            f"Pillow is required to crop an image element out of the source image "
+            f"({exc}); install it with: pip install -r requirements.txt"
+        ) from exc
+
+    try:
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            if not data:
+                raise ValueError("the source image is empty (0 bytes)")
+        else:
+            path = Path(source).expanduser()
+            data = path.read_bytes()
+            if not data:
+                raise ValueError(f"the source image at {path} is empty (0 bytes)")
+        # Read into memory and decode from there: the crop must not depend on a
+        # file handle staying open, and `load()` forces the decode NOW so a
+        # truncated file fails here rather than half way through the save.
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        return image
+    except PictureSourceError:  # pragma: no cover - defensive
+        raise
+    except Exception as exc:  # noqa: BLE001 - every decode failure is the same failure
+        raise PictureSourceError(
+            f"the source image could not be decoded ({type(exc).__name__}: {exc})"
+        ) from exc
+
+
+class _SourceImage:
+    """Decode the build's source image at most once, and remember the outcome.
+
+    A slide may carry several image elements and the source can be a multi-megabyte
+    PNG; decoding it per element would be wasteful, and re-reporting the same
+    failure per element would be noise. Both the image and the failure are cached,
+    and the failure is re-raised for every element that needs it, so each of them is
+    still skipped with its own reason.
+    """
+
+    __slots__ = ("_source", "_image", "_error", "_loaded")
+
+    def __init__(self, source: SourceImage | None) -> None:
+        self._source = source
+        self._image: Any = None
+        self._error: PictureSourceError | None = None
+        self._loaded = False
+
+    @property
+    def given(self) -> bool:
+        """True when a source image was supplied at all (decodable or not)."""
+        return self._source is not None
+
+    def image(self):
+        """The decoded image, or raise the (cached) :class:`PictureSourceError`."""
+        if not self._loaded:
+            self._loaded = True
+            try:
+                self._image = _decode_source_image(self._source)
+            except PictureSourceError as exc:
+                self._error = exc
+        if self._error is not None:
+            raise self._error
+        return self._image
+
+
+def _crop_box_px(bbox: BBox, width_px: int, height_px: int) -> tuple[int, int, int, int]:
+    """The element's normalized bbox as a pixel crop box on the source image.
+
+    x/w map onto the image WIDTH and y/h onto its HEIGHT - the same independent
+    per-axis mapping the normalized system uses everywhere else. The box is
+    intersected with the image and is never empty: a degenerate bbox yields a 1px
+    crop rather than a ``ValueError`` from Pillow.
+    """
+    scale = float(config.COORD_SCALE) or 1000.0
+    left = int(round(bbox.x / scale * width_px))
+    top = int(round(bbox.y / scale * height_px))
+    right = int(round((bbox.x + bbox.w) / scale * width_px))
+    bottom = int(round((bbox.y + bbox.h) / scale * height_px))
+
+    left = min(max(left, 0), max(width_px - 1, 0))
+    top = min(max(top, 0), max(height_px - 1, 0))
+    right = min(max(right, left + 1), width_px)
+    bottom = min(max(bottom, top + 1), height_px)
+    return left, top, right, bottom
+
+
+def _crop_png(image, bbox: BBox) -> bytes:
+    """Crop *image* to *bbox* and encode the crop as PNG bytes.
+
+    PNG (lossless) because the crop is often a chart or a logo with hard edges,
+    where JPEG artefacts would be visible. Modes PNG cannot store (CMYK, integer
+    or float modes) are converted to RGB rather than failing the element.
+    """
+    try:
+        width_px, height_px = (int(image.size[0]), int(image.size[1]))
+    except Exception as exc:  # noqa: BLE001 - a source with no readable size
+        raise PictureSourceError(
+            f"the source image has no readable size ({type(exc).__name__}: {exc})"
+        ) from exc
+    if width_px <= 0 or height_px <= 0:
+        raise PictureSourceError(
+            f"the source image has a degenerate size ({width_px}x{height_px}px)"
+        )
+
+    box = _crop_box_px(bbox, width_px, height_px)
+    try:
+        crop = image.crop(box)
+        if crop.mode not in ("1", "L", "LA", "P", "PA", "RGB", "RGBA"):
+            crop = crop.convert("RGB")
+        buffer = io.BytesIO()
+        try:
+            crop.save(buffer, format="PNG")
+        except (OSError, ValueError):
+            # e.g. a mode PNG refuses after all: one honest fallback, then give up.
+            buffer = io.BytesIO()
+            crop.convert("RGB").save(buffer, format="PNG")
+        data = buffer.getvalue()
+    except Exception as exc:  # noqa: BLE001 - one bad crop may not sink the deck
+        raise PictureSourceError(
+            f"the region {bbox.as_tuple()} could not be cropped out of the "
+            f"{width_px}x{height_px}px source image "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+
+    if not data:  # pragma: no cover - defensive
+        raise PictureSourceError(
+            f"the crop of region {bbox.as_tuple()} encoded to 0 bytes"
+        )
+    return data
+
+
+def add_picture(slide, el: ImageElement, source: SourceImage | None = None):
+    """Crop *el*'s region out of *source* and place it on the slide.
+
+    ``source`` is the ORIGINAL image the analyzer looked at: bytes, a path, or an
+    already-decoded PIL image. With no usable source this raises
+    :class:`PictureSourceError` instead of inventing something; the caller
+    (:func:`build_presentation`) turns that into a skipped element, a warning and a
+    placeholder outline.
+
+    The crop fills the element's bbox exactly. Its pixel aspect ratio need NOT match
+    the bbox's on-slide aspect ratio, so the picture may be stretched: the
+    normalized coordinate system scales the two axes independently, exactly as it
+    already does for every shape, table and text box, and matching the deck's own
+    geometry matters more here than preserving the crop's proportions. Said out loud
+    rather than left to drift.
+    """
+    # Resolve the crop BEFORE any geometry is computed: with no source image there
+    # is nothing to place, and scale_bbox would otherwise report its floor/clip
+    # adjustments for an element that is about to be skipped (the placeholder path
+    # reports them instead, once).
+    image = _decode_source_image(source)
+    left, top, width, height = scale_bbox(el.bbox)
+    # NB: the crop is taken from the bbox the spec asked for, while the placement
+    # uses the fitted geometry - so a bbox that scale_bbox had to clip or floor is
+    # stretched into the adjusted box. scale_bbox has already warned in that case.
+    png = _crop_png(image, el.bbox)
+
+    picture = slide.shapes.add_picture(
+        io.BytesIO(png), left, top, width=width, height=height
+    )
+    _disable_shadow(picture)
+    _set_alt_text(picture, getattr(el, "description", None))
+    return picture
+
+
+def _add_image_placeholder(slide, el: ImageElement) -> bool:
+    """Outline where an image element would have gone; True when it was drawn.
+
+    A skipped image otherwise leaves a mysterious hole: the deck looks finished and
+    the missing photo is only mentioned in a warning nobody re-reads. A thin dashed
+    grey rectangle is quiet enough not to read as slide content, and it is a native
+    shape, so the gap stays visible and editable in PowerPoint.
+    """
+    try:
+        left, top, width, height = scale_bbox(el.bbox)
+        shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+        _disable_shadow(shape)
+        if getattr(shape, "has_text_frame", False):
+            shape.text_frame.clear()
+        shape.fill.background()
+        shape.line.color.rgb = PLACEHOLDER_LINE_COLOR
+        shape.line.width = Pt(PLACEHOLDER_LINE_WIDTH_PT)
+        shape.line.dash_style = MSO_LINE_DASH_STYLE.DASH
+        return True
+    except Exception:  # noqa: BLE001 - a marker may never break a build
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Anti-flattening: the fence around the picture exception
+# --------------------------------------------------------------------------- #
+
+#: A picture shape, as python-pptx reports one. ``LINKED_PICTURE`` is included for
+#: the same reason ``services.preview`` includes it: it is still a picture.
+_PICTURE_TYPES = (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE)
+
+
+def _is_picture(shape) -> bool:
+    """True when *shape* is a picture, by shape type or by raw tag."""
+    try:
+        if shape.shape_type in _PICTURE_TYPES:
+            return True
+    except Exception:  # noqa: BLE001 - some shapes raise on shape_type
+        pass
+    try:  # pragma: no cover - the tag check only matters if shape_type failed
+        return shape._element.tag == qn("p:pic")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _shape_area(shape) -> int:
+    """A shape's on-slide area in EMU^2 (0 when it cannot be measured)."""
+    try:
+        width = max(int(shape.width or 0), 0)
+        height = max(int(shape.height or 0), 0)
+    except Exception:  # noqa: BLE001 - defensive
+        return 0
+    return width * height
+
+
+def _pct_of(part: float, whole: float) -> float:
+    """``part`` as a percentage of ``whole``, rounded; 0.0 when whole is unusable."""
+    try:
+        if not whole:
+            return 0.0
+        return round(float(part) / float(whole) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):  # pragma: no cover
+        return 0.0
+
+
+# The two predicates below are the ONLY place each numeric rule is evaluated, and
+# both :func:`flattening_report` and :func:`_enforce_not_flattened` call them. If
+# the reporter and the enforcer computed the same rule separately, they could
+# disagree by a rounding step - and then the builder would happily write a deck its
+# own report calls flattened.
+
+
+def _is_full_bleed(shape, slide_w: int, slide_h: int) -> bool:
+    """Rule 1: does this ONE picture cover the slide on both axes?"""
+    try:
+        width = int(shape.width or 0)
+        height = int(shape.height or 0)
+    except Exception:  # noqa: BLE001 - pragma: no cover - defensive
+        return False
+    return (
+        width * 100.0 >= FULL_BLEED_PICTURE_PCT * slide_w
+        and height * 100.0 >= FULL_BLEED_PICTURE_PCT * slide_h
+    )
+
+
+def _exceeds_picture_area(total_area: float, slide_area: float) -> bool:
+    """Rule 2: do the pictures together cover more than the area limit?"""
+    return _pct_of(total_area, slide_area) > MAX_PICTURE_AREA_PCT + _PCT_EPS
+
+
+def flattening_report(presentation) -> dict:
+    """Is this deck a real editable slide, or a flattened image of one?
+
+    THE definition of "flattened" for this project - the tests, the API and the
+    build itself all read it from here, so there is exactly one. It replaces the old
+    "a deck must contain zero picture shapes" assertion, which stopped being true
+    the moment a genuine photo/chart region became a legitimate ``image`` element.
+
+    Three rules, per slide:
+
+    1. **No single picture covering the slide** (>= :data:`FULL_BLEED_PICTURE_PCT`
+       of the slide width AND of its height). This is the literal thing this tool
+       exists not to do: the input image pasted onto a slide.
+    2. **All pictures together cover at most** :data:`MAX_PICTURE_AREA_PCT` **of the
+       slide.** Rule 1 alone has a hole: four pictures of 50%x50% each pass a 95%
+       per-picture check while tiling the slide into exactly the flattened
+       screenshot rule 1 forbids. Area closes it.
+    3. **A picture-only slide is a flattened slide.** If a slide carries any
+       picture it must ALSO carry at least one native object (auto shape,
+       connector, table or text box). A deck whose only content is pictures is not
+       an editable deck, whatever the individual sizes say.
+
+    Returns a dict::
+
+        {"flattened": bool,            # any rule violated anywhere
+         "violations": [str, ...],     # one human-readable line per violation
+         "slide_count": int,
+         "picture_count": int,
+         "slides": [{"index": int, "picture_count": int, "native_count": int,
+                     "picture_area_pct": float, "full_bleed_count": int,
+                     "flattened": bool, "violations": [str, ...]}, ...]}
+
+    A deck with no pictures at all is trivially not flattened.
+    """
+    slide_w = int(getattr(presentation, "slide_width", 0) or 0)
+    slide_h = int(getattr(presentation, "slide_height", 0) or 0)
+    slide_area = slide_w * slide_h
+
+    slides: list[dict] = []
+    violations: list[str] = []
+    picture_total = 0
+
+    for index, slide in enumerate(presentation.slides):
+        shapes = list(slide.shapes)
+        pictures = [shape for shape in shapes if _is_picture(shape)]
+        natives = [shape for shape in shapes if not _is_picture(shape)]
+        picture_total += len(pictures)
+
+        area = sum(_shape_area(shape) for shape in pictures)
+        area_pct = _pct_of(area, slide_area)
+        full_bleed = [
+            shape for shape in pictures if _is_full_bleed(shape, slide_w, slide_h)
+        ]
+
+        own: list[str] = []
+        if full_bleed:
+            own.append(
+                f"{len(full_bleed)} picture(s) cover >= {FULL_BLEED_PICTURE_PCT:g}% of "
+                "both slide axes: that is the source image pasted onto the slide"
+            )
+        if _exceeds_picture_area(area, slide_area):
+            own.append(
+                f"pictures cover {area_pct:g}% of the slide, above the "
+                f"{MAX_PICTURE_AREA_PCT:g}% limit: tiled pictures flatten a slide "
+                "just as well as one big one"
+            )
+        if pictures and not natives:
+            own.append(
+                f"the slide holds {len(pictures)} picture(s) and no native shape, "
+                "table or text box at all: a picture-only slide is not an editable "
+                "deck"
+            )
+
+        slides.append(
+            {
+                "index": index,
+                "picture_count": len(pictures),
+                "native_count": len(natives),
+                "picture_area_pct": area_pct,
+                "full_bleed_count": len(full_bleed),
+                "flattened": bool(own),
+                "violations": own,
+            }
+        )
+        violations.extend(f"slide {index + 1}: {reason}" for reason in own)
+
+    return {
+        "flattened": bool(violations),
+        "violations": violations,
+        "slide_count": len(slides),
+        "picture_count": picture_total,
+        "slides": slides,
+    }
+
+
+def _remove_shape(shape) -> bool:
+    """Take *shape* off its slide again; True when it is really gone.
+
+    For a picture the image RELATIONSHIP is dropped as well, and that is not a
+    detail: removing only the ``<p:pic>`` element leaves the image part behind in
+    the package (measured - ``ppt/media/image1.png`` was still written), so a deck
+    that refuses to show a flattened image would still be shipping its bytes.
+    python-pptx serializes the parts it can reach through the relationship graph,
+    so dropping the relationship drops the part with it.
+    """
+    rel_id = None
+    if _is_picture(shape):
+        try:
+            rel_id = getattr(shape._element, "blip_rId", None)
+        except Exception:  # noqa: BLE001 - pragma: no cover - defensive
+            rel_id = None
+    try:
+        element = shape._element
+        parent = element.getparent()
+        if parent is None:  # pragma: no cover - defensive
+            return False
+        parent.remove(element)
+    except Exception:  # noqa: BLE001 - pragma: no cover - defensive
+        return False
+    if rel_id:
+        try:
+            # Called AFTER the element is gone, so the reference count is 0.
+            shape.part.drop_rel(rel_id)
+        except Exception:  # noqa: BLE001 - pragma: no cover - an orphan part only
+            _warn(
+                "a rejected picture's image part could not be dropped from the "
+                "package; the deck still carries its bytes, unused."
+            )
+    return True
+
+
+def _enforce_not_flattened(prs, slide, pictures: list[tuple[int, Any]]) -> None:
+    """Drop the picture(s) that would make this slide a flattened image.
+
+    The analyzer can ask for a flattened slide - one huge ``image`` element, or four
+    quarter-slide ones - and the honest answer is to refuse that one element and say
+    so, not to write the deck the rule exists to prevent. The rules are
+    :func:`flattening_report`'s; this applies them while the element indices are
+    still known, so every warning names the element the user can go and fix.
+
+    No placeholder outline is drawn here (unlike the missing-source case): these
+    elements were rejected on purpose, and a full-bleed "missing image" outline
+    would just be a second flattened rectangle.
+    """
+    if not pictures:
+        return
+    slide_w = int(getattr(prs, "slide_width", 0) or 0)
+    slide_h = int(getattr(prs, "slide_height", 0) or 0)
+    if slide_w <= 0 or slide_h <= 0:  # pragma: no cover - defensive
+        return
+    slide_area = slide_w * slide_h
+    kept = list(pictures)
+
+    def drop(entry: tuple[int, Any], reason: str) -> bool:
+        index, shape = entry
+        if _remove_shape(shape):
+            kept.remove(entry)
+            _warn(f"element #{index} (image) was NOT rendered: {reason}")
+            return True
+        # Only reachable if the shape's XML was already detached from the slide.
+        _warn(
+            f"element #{index} (image) {reason} - and it could NOT be taken off the "
+            "slide again, so the deck may be flattened; do not trust this deck."
+        )
+        return False
+
+    # Rule 1: one picture covering the slide.
+    for entry in list(kept):
+        _, shape = entry
+        if _is_full_bleed(shape, slide_w, slide_h):
+            drop(
+                entry,
+                f"its crop would cover >= {FULL_BLEED_PICTURE_PCT:g}% of both slide "
+                "axes, i.e. the whole slide. That is the source image pasted onto a "
+                "slide, which is exactly what this tool exists to avoid; skipped it. "
+                "Re-run the conversion so the region is described as shapes, text and "
+                "tables instead.",
+            )
+
+    # Rule 2: pictures tiling the slide. Largest first, until the total fits.
+    while kept:
+        total = sum(_shape_area(shape) for _, shape in kept)
+        if not _exceeds_picture_area(total, slide_area):
+            break
+        entry = max(kept, key=lambda item: _shape_area(item[1]))
+        if not drop(
+            entry,
+            f"the image elements together would cover "
+            f"{_pct_of(total, slide_area):g}% of the slide, above the "
+            f"{MAX_PICTURE_AREA_PCT:g}% limit - tiled crops flatten a slide just as "
+            "well as one big one; skipped the largest of them.",
+        ):
+            break  # pragma: no cover - drop() only fails if the XML is detached
+
+    # Rule 3: nothing on the slide but pictures.
+    if kept and not [shape for shape in slide.shapes if not _is_picture(shape)]:
+        for entry in list(kept):
+            if not drop(
+                entry,
+                "the slide would hold nothing but picture(s) - no shape, table or "
+                "text box at all - and a picture-only slide is a flattened image, not "
+                "an editable deck; skipped it.",
+            ):
+                break  # pragma: no cover - as above
+
+
 # --------------------------------------------------------------------------- #
 # Deck assembly
 # --------------------------------------------------------------------------- #
@@ -636,17 +1346,22 @@ def _apply_background(slide, color: str | None) -> None:
         _warn(f"could not set slide background ({exc}); continuing without it")
 
 
-def _render_element(slide, el) -> None:
-    """Dispatch one element to its renderer."""
+def _render_element(slide, el, source: _SourceImage | None = None):
+    """Dispatch one element to its renderer; returns the shape it added.
+
+    ``source`` is only consulted by an ``image`` element and stays optional so the
+    other renderers can be called (and tested) without one.
+    """
     if isinstance(el, ShapeElement):
-        add_shape(slide, el)
-        return
+        return add_shape(slide, el)
     if isinstance(el, TableElement):
-        add_table(slide, el)
-        return
+        return add_table(slide, el)
     if isinstance(el, TextElement):
-        add_textbox(slide, el)
-        return
+        return add_textbox(slide, el)
+    if isinstance(el, ConnectorElement):
+        return add_connector(slide, el)
+    if isinstance(el, ImageElement):
+        return add_picture(slide, el, source.image() if source is not None else None)
     raise PptxBuildError(f"unsupported element type: {getattr(el, 'type', type(el).__name__)!r}")
 
 
@@ -682,11 +1397,23 @@ def _rollback_shapes(slide, before: list) -> bool:
         return False
 
 
-def build_presentation(spec: SlideSpec) -> Presentation:
+def build_presentation(
+    spec: SlideSpec, source_image: SourceImage | None = None
+) -> Presentation:
     """Build a one-slide 16:9 deck from ``spec``.
 
     Elements are rendered in order, which is the z-order. One failing element is
     reported on stderr and skipped; it never aborts the build.
+
+    Args:
+        spec: the slide to draw.
+        source_image: the ORIGINAL image the analyzer looked at - raw bytes (the
+            HTTP layer), a path (the CLI), or an already-decoded PIL image -
+            needed only to crop ``image`` elements out of. It is optional and
+            defaults to ``None`` so every existing caller keeps working unchanged;
+            with no source image, image elements are skipped with a warning and a
+            placeholder outline while the rest of the slide builds normally. The
+            image is decoded at most once per build, and only if it is needed.
     """
     if spec is None:
         raise PptxBuildError("build_presentation() requires a SlideSpec, got None")
@@ -705,29 +1432,58 @@ def build_presentation(spec: SlideSpec) -> Presentation:
 
     _apply_background(slide, getattr(spec, "background_color", None))
 
+    source = _SourceImage(source_image)
+    #: (element index, picture shape) for every crop that reached the slide, so the
+    #: anti-flattening pass can name the element behind a picture it has to drop.
+    pictures: list[tuple[int, Any]] = []
+
     for index, el in enumerate(getattr(spec, "elements", None) or []):
         before = _shape_elements(slide)
         try:
-            _render_element(slide, el)
+            shape = _render_element(slide, el, source)
         except Exception as exc:  # noqa: BLE001 - isolation is the whole point
             kind = getattr(el, "type", type(el).__name__)
             detail = f"{type(exc).__name__}: {exc}"
             # Say "skipped" only when nothing of the element is left behind.
-            if _rollback_shapes(slide, before):
-                _warn(f"skipped element #{index} ({kind}): {detail}")
-            else:  # pragma: no cover - only if the rollback itself fails
+            if not _rollback_shapes(slide, before):  # pragma: no cover - rollback fails
                 _warn(
                     f"element #{index} ({kind}) failed half way through and is only "
                     f"PARTIALLY rendered (an empty shape may remain): {detail}"
                 )
+            elif isinstance(el, ImageElement):
+                # An image element leaves a visible hole, so mark it: the message
+                # says plainly that nothing was rendered, and the outline shows
+                # where.
+                marked = _add_image_placeholder(slide, el)
+                tail = (
+                    " A dashed placeholder outline marks its bbox so the gap is "
+                    "visible in the deck."
+                    if marked
+                    else ""
+                )
+                _warn(f"element #{index} (image) was NOT rendered: {detail}.{tail}")
+            else:
+                _warn(f"skipped element #{index} ({kind}): {detail}")
+        else:
+            if shape is not None and _is_picture(shape):
+                pictures.append((index, shape))
+
+    # Last, because rule 3 can only be judged once the whole slide is on the page.
+    _enforce_not_flattened(prs, slide, pictures)
 
     return prs
 
 
-def build_pptx(spec: SlideSpec, output_path: str | Path) -> Path:
-    """Build the deck and write it to ``output_path``; returns the resolved path."""
+def build_pptx(
+    spec: SlideSpec, output_path: str | Path, source_image: SourceImage | None = None
+) -> Path:
+    """Build the deck and write it to ``output_path``; returns the resolved path.
+
+    ``source_image`` is passed straight to :func:`build_presentation` and is
+    optional for the same reason it is optional there.
+    """
     path = Path(output_path).expanduser()
-    prs = build_presentation(spec)
+    prs = build_presentation(spec, source_image)
 
     parent = path.parent
     try:

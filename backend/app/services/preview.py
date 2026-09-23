@@ -36,27 +36,54 @@ This matters more than it looks: on python-pptx 1.0.2 (verified)
 when the fill is not solid, ``AttributeError`` when the colour is a scheme
 colour - so every colour read here is guarded.
 
+Connectors and pictures
+-----------------------
+Two element kinds do not fit the "a box with styling" mould and are read
+differently:
+
+* a **connector** has no box at all - it is two points - so it is reported as
+  ``start_pct``/``end_pct`` instead of ``left/top/width/height``. It is detected
+  as ``MSO_SHAPE_TYPE.LINE``, because ``MSO_SHAPE_TYPE.CONNECTOR`` does not
+  exist on python-pptx 1.0.2 (verified) and matching on it would match nothing;
+* a **picture** is now a legitimate element - an ``image`` region the analyzer
+  could not express as a shape, a table or text, cropped out of the source
+  image - so it is reported as ``kind: "image"`` carrying the crop itself. The
+  crop is read back out of the DECK (``shape.image.blob``), never from the
+  source image, so the preview shows the bytes that were really embedded.
+
 Robustness
 ----------
 Every accessor is wrapped. A shape this module cannot make sense of degrades to
-``{"kind": "unsupported"}`` with its geometry rather than raising, and a picture
-shape - which this product never emits, since nothing is ever flattened - would
-do the same. The caller (``converter.preview_for``) additionally treats any
-escape from here as "no preview, plus a warning", so a preview can never fail a
-conversion.
+``{"kind": "unsupported"}`` with its geometry rather than raising. The caller
+(``converter.preview_for``) additionally treats any escape from here as "no
+preview, plus a warning", so a preview can never fail a conversion. Where a
+field has to be given up on - a crop too big to ship, a picture whose bytes
+cannot be read - the field goes to ``null`` AND a line is written to stderr,
+which ``converter.warning_lines`` turns into the response's ``warnings`` array:
+a missing crop is visible, never silent.
 """
 
 from __future__ import annotations
 
+import base64
+import io
+import re
+import sys
 from typing import Any
 
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.oxml.ns import qn
 from pptx.util import Emu
 
 from .. import config
 
-__all__ = ["build_preview"]
+__all__ = [
+    "build_preview",
+    "PREVIEW_IMAGE_MAX_PX",
+    "PREVIEW_IMAGE_MAX_URI_BYTES",
+    "WARN_PREFIX",
+]
 
 #: python-pptx auto-shape preset -> the name the preview contract uses.
 #: Anything else is reported as ``"other"``; the UI draws it as a plain box.
@@ -84,10 +111,78 @@ _PCT_DIGITS = 4
 #: Point sizes are rounded to the precision PowerPoint itself stores (1/100 pt).
 _PT_DIGITS = 2
 
-#: Shape types that would mean part of the image was flattened into the deck.
-#: The builder emits none, ever - this exists so that if one somehow appeared,
-#: the preview says "unsupported" instead of drawing a box where a picture is.
+#: Shape types that carry an embedded (or linked) bitmap. These are the
+#: ``image`` elements: a region the analyzer could not express natively, cropped
+#: out of the source image by the builder. They are legitimate - what is NOT
+#: legitimate is a deck made only of them, which is what
+#: ``pptx_builder.flattening_report`` exists to catch.
 _PICTURE_TYPES = (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE)
+
+#: How a connector reports itself. NOT ``MSO_SHAPE_TYPE.CONNECTOR``: that member
+#: does not exist on python-pptx 1.0.2, and a shape added with
+#: ``slide.shapes.add_connector`` comes back as ``LINE`` (value 9) - verified.
+_CONNECTOR_TYPES = (MSO_SHAPE_TYPE.LINE,)
+
+#: ``<a:prstGeom prst>`` values that mean "elbow". python-pptx writes ``line``
+#: for ``MSO_CONNECTOR.STRAIGHT`` and ``bentConnector3`` for ``.ELBOW``
+#: (verified); the other bent presets are listed because PowerPoint itself uses
+#: them when a user drags an elbow's midpoint, and such a deck may be re-read.
+_ELBOW_PRESETS = frozenset(
+    {"bentconnector2", "bentconnector3", "bentconnector4", "bentconnector5"}
+)
+
+#: The contract's two dash values. Anything that is not literally ``SOLID`` -
+#: including the dotted and dash-dot presets PowerPoint can set - previews as
+#: "dashed", because the UI has exactly one non-solid stroke to draw.
+_SOLID_DASH_NAME = "SOLID"
+
+#: An ``<a:headEnd>``/``<a:tailEnd>`` with this type is an explicit "no arrow".
+_NO_ARROW_TYPE = "none"
+
+#: Longest side of the crop shipped in a preview, in pixels. The preview is a
+#: thumbnail in a panel a few hundred pixels wide; anything larger is bytes the
+#: client pays for and cannot see.
+PREVIEW_IMAGE_MAX_PX: int = 480
+
+#: Hard cap on one ``data_uri``, in bytes of the URI itself. Past this the field
+#: goes to ``null`` with a warning: a preview is a convenience and may not turn
+#: a JSON response into a multi-megabyte download.
+PREVIEW_IMAGE_MAX_URI_BYTES: int = 96 * 1024
+
+#: JPEG qualities tried, in order, when the PNG re-encode will not fit the cap.
+#: A photographic crop at 480px is routinely ~200-400 KB as PNG, so a PNG-only
+#: encoder would answer ``null`` for exactly the elements this feature exists to
+#: show. The crop is already being re-encoded (it is resized), so trading
+#: losslessness for a visible thumbnail costs nothing the preview was promising.
+_JPEG_QUALITIES: tuple[int, ...] = (80, 60, 40)
+
+#: What a stderr line from this module is prefixed with, so
+#: ``converter.warning_lines`` can strip it (and so a test can find it).
+WARN_PREFIX: str = "[preview] warning: "
+
+#: python-pptx's own default alt text for a picture added from a stream is the
+#: literal ``image.png`` (verified), and from a path it is the basename. Neither
+#: is a description, so a ``descr`` that is merely a filename is discarded - the
+#: alternative is showing the user "image.png" as the model's description of the
+#: region, which would be a false claim.
+_FILENAME_DESCR_RE = re.compile(r"(?i)\A[^\s/\\]{1,120}\.(png|jpe?g|webp|gif|bmp|tiff?)\Z")
+
+#: python-pptx names added pictures ``Picture 1``, ``Picture 2``, ... Those are
+#: placeholders, not descriptions, and are discarded for the same reason.
+_GENERIC_PICTURE_NAME_RE = re.compile(r"(?i)\A(picture|image|graphic|object)\s*\d*\Z")
+
+
+def _warn(message: str) -> None:
+    """Report a field this module had to give up on, on stderr.
+
+    stderr is how every other module in this project reports a non-fatal
+    problem, and ``converter.warning_lines`` already turns that stream into the
+    response's ``warnings`` array - so a dropped crop reaches the user through
+    the channel they already read, and the CLI keeps seeing it too. The preview
+    payload itself gains no new top-level field, which is what keeps the
+    existing contract byte-identical.
+    """
+    print(f"{WARN_PREFIX}{message}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +334,242 @@ def _shape_type(shape: Any) -> Any:
         return shape.shape_type
     except Exception:  # noqa: BLE001
         return None
+
+
+# --------------------------------------------------------------------------- #
+# connector readers
+# --------------------------------------------------------------------------- #
+def _emu_attr(shape: Any, name: str) -> int:
+    """One of ``begin_x``/``begin_y``/``end_x``/``end_y`` as an int of EMU.
+
+    These are the only geometry a connector has, and python-pptx reads them back
+    through the ``flipH``/``flipV`` it wrote - so a right-to-left connector
+    round-trips with its start still at the start (verified on 1.0.2, before and
+    after a save/reload).
+    """
+    try:
+        value = getattr(shape, name, None)
+        return 0 if value is None else int(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return 0
+
+
+def _prst_geom(shape: Any) -> str:
+    """The shape's ``<a:prstGeom prst>`` value, lowercased, or ``""``."""
+    try:
+        preset = shape._element.spPr.find(qn("a:prstGeom"))
+        if preset is None:
+            return ""
+        return str(preset.get("prst") or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _line_element(shape: Any) -> Any:
+    """The shape's ``<a:ln>`` element, or ``None`` when it has no outline.
+
+    Read off the lxml tree rather than through ``LineFormat``: the arrowheads
+    live in ``<a:headEnd>``/``<a:tailEnd>``, and python-pptx 1.0.2 exposes
+    NEITHER (``line`` offers only colour, dash_style, fill and width - verified),
+    so the element is the only place they can be read from.
+    """
+    try:
+        return shape._element.spPr.find(qn("a:ln"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _has_arrow(line_element: Any, tag: str) -> bool:
+    """Whether ``<a:ln>`` carries an arrowhead at ``tag``.
+
+    ``a:headEnd`` is the BEGIN end of the line and ``a:tailEnd`` the END one,
+    which is how ``arrow_start``/``arrow_end`` map onto the file.
+    """
+    if line_element is None:
+        return False
+    try:
+        end = line_element.find(qn(tag))
+        if end is None:
+            return False
+        kind = str(end.get("type") or "").strip().lower()
+        # A missing type attribute defaults to "none" in the schema, so only an
+        # explicit, non-"none" arrowhead counts as an arrow.
+        return bool(kind) and kind != _NO_ARROW_TYPE
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dash(line: Any) -> str:
+    """``"dashed"`` for any preset dash, ``"solid"`` otherwise.
+
+    An untouched line reads back as ``dash_style is None``, which is solid.
+    """
+    try:
+        style = None if line is None else line.dash_style
+    except Exception:  # noqa: BLE001
+        return "solid"
+    if style is None:
+        return "solid"
+    name = str(getattr(style, "name", None) or style).upper()
+    return "solid" if name == _SOLID_DASH_NAME else "dashed"
+
+
+# --------------------------------------------------------------------------- #
+# picture readers
+# --------------------------------------------------------------------------- #
+def _alt_text(shape: Any) -> str:
+    """The picture's alt text (``<p:cNvPr descr>``), or ``""``."""
+    try:
+        return str(shape._element._nvXxPr.cNvPr.get("descr") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _picture_description(shape: Any) -> str | None:
+    """The description the builder recorded on the picture, or ``None``.
+
+    The preview reads the DECK, so the description has to be in the deck: the
+    alt text is the semantically right place for it, and the shape name is
+    accepted as a second spelling. Values that are only python-pptx's own
+    defaults - ``image.png``, ``Picture 1`` - are discarded rather than shown,
+    because reporting them as the analyzer's description would be untrue.
+    """
+    for raw in (_alt_text(shape), _safe_name(shape)):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        if _FILENAME_DESCR_RE.match(text) or _GENERIC_PICTURE_NAME_RE.match(text):
+            continue
+        return text
+    return None
+
+
+def _safe_name(shape: Any) -> str:
+    try:
+        return str(shape.name or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _encode_image(image: Any, image_format: str, **options: Any) -> bytes:
+    """One Pillow encode into memory, or ``b""`` when it cannot be done."""
+    try:
+        buffer = io.BytesIO()
+        image.save(buffer, image_format, **options)
+        return buffer.getvalue()
+    except Exception:  # noqa: BLE001 - an encoder may never break a preview
+        return b""
+
+
+def _thumbnail_candidates(blob: bytes) -> list[tuple[str, bytes]] | None:
+    """``[(content_type, bytes), ...]`` for ``blob``, best quality first.
+
+    ``None`` means Pillow could not be used at all, which is a different case
+    from "Pillow produced nothing usable" - see :func:`_crop_data_uri`.
+
+    ``Image.thumbnail`` only ever shrinks, so a crop already under
+    :data:`PREVIEW_IMAGE_MAX_PX` is re-encoded at its own size rather than
+    blown up.
+    """
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow is in requirements.txt
+        return None
+
+    try:
+        with Image.open(io.BytesIO(blob)) as opened:
+            opened.load()
+            thumbnail = opened.copy()
+    except Exception:  # noqa: BLE001 - a corrupt blob is not a crash
+        return []
+
+    try:
+        thumbnail.thumbnail(
+            (PREVIEW_IMAGE_MAX_PX, PREVIEW_IMAGE_MAX_PX),
+            getattr(Image, "LANCZOS", None) or Image.BICUBIC,
+        )
+    except Exception:  # noqa: BLE001 - previewing the full size beats nothing
+        pass
+
+    candidates: list[tuple[str, bytes]] = []
+    png = _encode_image(thumbnail, "PNG", optimize=True)
+    if png:
+        candidates.append(("image/png", png))
+
+    # JPEG cannot carry alpha or a palette, so flatten onto white first.
+    flattened = thumbnail
+    if thumbnail.mode not in {"RGB", "L"}:
+        try:
+            flattened = thumbnail.convert("RGB")
+        except Exception:  # noqa: BLE001
+            flattened = None  # type: ignore[assignment]
+    if flattened is not None:
+        for quality in _JPEG_QUALITIES:
+            jpeg = _encode_image(flattened, "JPEG", quality=quality, optimize=True)
+            if jpeg:
+                candidates.append(("image/jpeg", jpeg))
+    return candidates
+
+
+def _data_uri(content_type: str, data: bytes) -> str:
+    """``data:<type>;base64,<...>``, all ASCII, so ``len`` IS its byte count."""
+    return f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _crop_data_uri(shape: Any) -> str | None:
+    """The picture's own bytes as a capped, downscaled ``data:`` URI.
+
+    Read from the DECK, not from the source image: the point of the preview is
+    to show what was really embedded, so a builder that cropped the wrong region
+    must be visible here rather than papered over.
+
+    Returns ``None`` - and warns - when the bytes cannot be read, cannot be
+    decoded, or will not fit :data:`PREVIEW_IMAGE_MAX_URI_BYTES` even at the
+    lowest quality. ``None`` is a value the contract pins and the UI draws as a
+    labelled placeholder, so it is a degradation, not a failure.
+    """
+    try:
+        image = shape.image
+        blob = bytes(image.blob or b"")
+        content_type = str(image.content_type or "") or "application/octet-stream"
+        pixels = tuple(int(value) for value in (image.size or (0, 0)))
+    except Exception as exc:  # noqa: BLE001
+        _warn(
+            f"an image element's embedded bytes could not be read back from the "
+            f"deck ({type(exc).__name__}: {exc}); the preview shows a placeholder "
+            "instead of the crop. The .pptx itself is unaffected."
+        )
+        return None
+
+    if not blob:
+        _warn(
+            "an image element carries no embedded bytes, so the preview shows a "
+            "placeholder instead of the crop. The .pptx itself is unaffected."
+        )
+        return None
+
+    candidates = _thumbnail_candidates(blob)
+    if candidates is None:
+        # No Pillow: the crop can only be shipped if it ALREADY satisfies the
+        # size rule, because there is nothing here that can shrink it. Shipping
+        # it unresized would break the contract's 480px promise.
+        longest = max(pixels) if pixels else 0
+        candidates = (
+            [(content_type, blob)] if 0 < longest <= PREVIEW_IMAGE_MAX_PX else []
+        )
+
+    for candidate_type, data in candidates:
+        uri = _data_uri(candidate_type, data)
+        if len(uri) <= PREVIEW_IMAGE_MAX_URI_BYTES:
+            return uri
+
+    _warn(
+        "an image element's crop is too large to include in the preview "
+        f"(it does not fit {PREVIEW_IMAGE_MAX_URI_BYTES // 1024} KB even "
+        f"downscaled to {PREVIEW_IMAGE_MAX_PX}px), so the preview shows a "
+        "placeholder instead. The .pptx itself carries the full crop."
+    )
+    return None
 
 
 def _fonts_of(paragraph: Any) -> list[Any]:
@@ -412,16 +743,62 @@ def _shape_payload(shape: Any, geometry: dict[str, float]) -> dict[str, Any]:
     }
 
 
+def _connector_payload(
+    shape: Any, slide_width: int, slide_height: int
+) -> dict[str, Any]:
+    """A connector: two points, its arrowheads and its stroke.
+
+    Deliberately NO ``left/top/width/height``: a connector has no box in the
+    schema either (``ConnectorElement`` carries ``start_point``/``end_point``
+    and no ``bbox``), and the box python-pptx computes for it loses which end is
+    which as soon as the line runs right-to-left. x scales by the slide's WIDTH
+    and y by its HEIGHT, the same pairing as every other element.
+    """
+    line = getattr(shape, "line", None)
+    line_element = _line_element(shape)
+    return {
+        "kind": "connector",
+        "start_pct": {
+            "x": _pct(_emu_attr(shape, "begin_x"), slide_width),
+            "y": _pct(_emu_attr(shape, "begin_y"), slide_height),
+        },
+        "end_pct": {
+            "x": _pct(_emu_attr(shape, "end_x"), slide_width),
+            "y": _pct(_emu_attr(shape, "end_y"), slide_height),
+        },
+        "elbow": _prst_geom(shape) in _ELBOW_PRESETS,
+        "arrow_start": _has_arrow(line_element, "a:headEnd"),
+        "arrow_end": _has_arrow(line_element, "a:tailEnd"),
+        "dash": _dash(line),
+        "color": _line_color(line),
+        "width_pt": _line_width_pt(line),
+    }
+
+
+def _image_payload(shape: Any, geometry: dict[str, float]) -> dict[str, Any]:
+    """A picture: its box, the crop that was really embedded, its description."""
+    return {
+        "kind": "image",
+        **geometry,
+        "data_uri": _crop_data_uri(shape),
+        "description": _picture_description(shape),
+    }
+
+
 def _one_shape(shape: Any, slide_width: int, slide_height: int) -> dict[str, Any]:
     """Dispatch one shape onto its payload, degrading rather than raising."""
     geometry = _geometry(shape, slide_width, slide_height)
     shape_type = _shape_type(shape)
 
-    # Checked first: a picture must never be previewed as anything else.
-    if shape_type in _PICTURE_TYPES:
-        return {"kind": "unsupported", **geometry}
-
     try:
+        # Pictures and connectors are checked FIRST, because neither can be
+        # previewed as anything else without lying about the slide: a picture
+        # drawn as an empty box hides that a region was embedded as a bitmap,
+        # and a connector drawn as its bounding box loses its direction.
+        if shape_type in _PICTURE_TYPES:
+            return _image_payload(shape, geometry)
+        if shape_type in _CONNECTOR_TYPES:
+            return _connector_payload(shape, slide_width, slide_height)
         if shape_type == MSO_SHAPE_TYPE.TABLE or getattr(shape, "has_table", False):
             return _table_payload(shape, geometry)
         if shape_type == MSO_SHAPE_TYPE.TEXT_BOX:

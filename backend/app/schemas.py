@@ -36,8 +36,13 @@ __all__ = [
     "BaseElement",
     "COORD_MAX",
     "COORD_MIN",
+    "ConnectorElement",
+    "ConnectorKind",
+    "DashStyle",
     "Element",
     "ElementsAllDroppedError",
+    "ImageElement",
+    "Point",
     "ShapeElement",
     "ShapeKind",
     "SlideSpec",
@@ -50,7 +55,19 @@ __all__ = [
     "validate_elements",
 ]
 
-ShapeKind = Literal["rectangle", "rounded_rectangle", "circle"]
+ShapeKind = Literal[
+    "rectangle",
+    "rounded_rectangle",
+    "circle",
+    # Block arrows: a thick, filled arrow BODY, not a line. A thin diagram
+    # arrow joining two boxes is a ``connector`` instead.
+    "arrow_right",
+    "arrow_left",
+    "arrow_up",
+    "arrow_down",
+]
+ConnectorKind = Literal["straight", "elbow"]
+DashStyle = Literal["solid", "dashed"]
 Align = Literal["left", "center", "right"]
 
 COORD_MIN = 0
@@ -292,6 +309,90 @@ class BBox(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# point (connector endpoints)
+# ---------------------------------------------------------------------------
+
+#: The two components a point must supply, in reporting order.
+_POINT_COMPONENTS = ("x", "y")
+
+
+class Point(BaseModel):
+    """One normalized ``(x, y)`` position in the same 0..1000 system as :class:`BBox`.
+
+    A connector has no bbox - it IS its two endpoints - so this is the geometry
+    a :class:`ConnectorElement` carries instead.
+
+    Tolerance and strictness mirror :class:`BBox` exactly, for the same reason:
+    a value that is PRESENT is coerced (floats, numeric strings, out-of-range
+    numbers are rounded and clamped to ``0..1000``), while a component that is
+    ABSENT or unparseable may NOT be defaulted. Defaulting a missing ``y`` to 0
+    would draw a connector to the top-left corner of the slide and report
+    success, which is the silent-wrong-deck failure this project refuses to
+    ship. An unreadable component therefore raises, the *element* becomes
+    invalid, and :func:`validate_elements` drops exactly that element naming the
+    component, e.g. ``"element 3 (connector): start_point - 'y' is missing or
+    unreadable"``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # As on BBox, these defaults only guarantee that a VALIDATED point carries
+    # both attributes; `_coerce` never lets an incomplete input reach them.
+    x: int = 0
+    y: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> Any:
+        """Accept ``[x, y]``, ``(x, y)`` or ``{"x": ..., "y": ...}``.
+
+        Raises:
+            PydanticCustomError: when x or y is missing or unparseable.
+        """
+        if isinstance(data, Point):
+            return data
+
+        raw_x: Any = _SENTINEL
+        raw_y: Any = _SENTINEL
+
+        if isinstance(data, (list, tuple)):
+            items = list(data)[:2]
+            while len(items) < 2:
+                items.append(_SENTINEL)
+            raw_x, raw_y = items
+        elif isinstance(data, dict):
+            raw_x = _pick(data, _X_KEYS)
+            raw_y = _pick(data, _Y_KEYS)
+        else:
+            # Not a recognizable container - let pydantic report a clean error.
+            return data
+
+        unreadable = [
+            name
+            for name, raw in zip(_POINT_COMPONENTS, (raw_x, raw_y))
+            if raw is _SENTINEL or _to_number(raw) is None
+        ]
+        if unreadable:
+            quoted = ", ".join(repr(name) for name in unreadable)
+            raise PydanticCustomError(
+                "point_incomplete",
+                "{quoted} {verb} missing or unreadable",
+                {
+                    "quoted": quoted,
+                    "verb": "is" if len(unreadable) == 1 else "are",
+                },
+            )
+
+        return {
+            "x": _clamp_int(raw_x, minimum=COORD_MIN, maximum=COORD_MAX, default=0),
+            "y": _clamp_int(raw_y, minimum=COORD_MIN, maximum=COORD_MAX, default=0),
+        }
+
+    def as_tuple(self) -> tuple[int, int]:
+        return (self.x, self.y)
+
+
+# ---------------------------------------------------------------------------
 # elements
 # ---------------------------------------------------------------------------
 
@@ -310,6 +411,68 @@ _KIND_ALIASES = {
     "oval": "circle",
     "ellipse": "circle",
     "round": "circle",
+    # Block arrows. "arrow" with no direction is the one ambiguous spelling;
+    # it maps to the overwhelmingly common right-pointing arrow, because
+    # degrading it to a rectangle would draw a BOX where an arrow belongs.
+    "arrow": "arrow_right",
+    "block_arrow": "arrow_right",
+    "arrow_right": "arrow_right",
+    "arrow-right": "arrow_right",
+    "arrowright": "arrow_right",
+    "right_arrow": "arrow_right",
+    "right-arrow": "arrow_right",
+    "rightarrow": "arrow_right",
+    "block_arrow_right": "arrow_right",
+    "arrow_left": "arrow_left",
+    "arrow-left": "arrow_left",
+    "arrowleft": "arrow_left",
+    "left_arrow": "arrow_left",
+    "left-arrow": "arrow_left",
+    "leftarrow": "arrow_left",
+    "block_arrow_left": "arrow_left",
+    "arrow_up": "arrow_up",
+    "arrow-up": "arrow_up",
+    "arrowup": "arrow_up",
+    "up_arrow": "arrow_up",
+    "up-arrow": "arrow_up",
+    "uparrow": "arrow_up",
+    "block_arrow_up": "arrow_up",
+    "arrow_down": "arrow_down",
+    "arrow-down": "arrow_down",
+    "arrowdown": "arrow_down",
+    "down_arrow": "arrow_down",
+    "down-arrow": "arrow_down",
+    "downarrow": "arrow_down",
+    "block_arrow_down": "arrow_down",
+}
+
+_CONNECTOR_KIND_ALIASES = {
+    "straight": "straight",
+    "line": "straight",
+    "direct": "straight",
+    "elbow": "elbow",
+    "bent": "elbow",
+    "bend": "elbow",
+    "angle": "elbow",
+    "angled": "elbow",
+    "orthogonal": "elbow",
+    "right_angle": "elbow",
+    "right-angle": "elbow",
+}
+
+_DASH_STYLE_ALIASES = {
+    "solid": "solid",
+    "none": "solid",
+    "plain": "solid",
+    "continuous": "solid",
+    "dashed": "dashed",
+    "dash": "dashed",
+    "dashdot": "dashed",
+    "dash_dot": "dashed",
+    "dotted": "dashed",
+    "dot": "dashed",
+    "long_dash": "dashed",
+    "longdash": "dashed",
 }
 
 _ALIGN_ALIASES = {
@@ -349,7 +512,13 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 
 class BaseElement(BaseModel):
-    """Fields shared by every slide element."""
+    """Fields shared by every BOX-shaped slide element.
+
+    NOT every element: :class:`ConnectorElement` deliberately does not inherit
+    from this, because a connector has no bounding box at all - it is defined by
+    two endpoints. Anything iterating :attr:`SlideSpec.elements` must therefore
+    not read ``element.bbox`` unconditionally.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -518,8 +687,106 @@ class TextElement(BaseElement):
         return _ALIGN_ALIASES.get(text, "left")
 
 
+class ConnectorElement(BaseModel):
+    """A diagram connector: a straight or elbowed line joining two places.
+
+    Deliberately NOT a :class:`BaseElement`: a connector carries no ``bbox``,
+    its geometry is the pair of :class:`Point` endpoints. Arrowheads are opt-in
+    per end (``arrow_end`` defaults to True, the one-way diagram arrow).
+
+    A thick, filled BLOCK arrow is not this: that is a ``shape`` with
+    ``kind="arrow_right"`` and friends.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["connector"]
+    kind: ConnectorKind = "straight"
+    start_point: Point
+    end_point: Point
+    arrow_start: bool = False
+    arrow_end: bool = True
+    dash_style: DashStyle = "solid"
+    color: str | None = None
+    width_pt: float | None = None
+
+    _norm_colors = field_validator("color", mode="before")(_colour_field)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _norm_kind(cls, value: Any) -> str:
+        """Unknown/absent -> ``"straight"``: a plain line is the safe default.
+
+        Degrading rather than raising, exactly like ``ShapeElement.kind``: the
+        connector still joins the right two points, which is the information
+        that matters, so losing the element over its routing style would be a
+        strictly worse deck.
+        """
+        if value is None:
+            return "straight"
+        text = str(value).strip().lower().replace(" ", "_")
+        return _CONNECTOR_KIND_ALIASES.get(text, "straight")
+
+    @field_validator("dash_style", mode="before")
+    @classmethod
+    def _norm_dash_style(cls, value: Any) -> str:
+        if value is None:
+            return "solid"
+        text = str(value).strip().lower().replace(" ", "_")
+        return _DASH_STYLE_ALIASES.get(text, "solid")
+
+    @field_validator("arrow_start", mode="before")
+    @classmethod
+    def _norm_arrow_start(cls, value: Any) -> bool:
+        return _coerce_bool(value, False)
+
+    @field_validator("arrow_end", mode="before")
+    @classmethod
+    def _norm_arrow_end(cls, value: Any) -> bool:
+        return _coerce_bool(value, True)
+
+    @field_validator("width_pt", mode="before")
+    @classmethod
+    def _norm_width_pt(cls, value: Any) -> float | None:
+        """``None`` means "unspecified"; the builder falls back to the config
+        default (``config.DEFAULT_BORDER_WIDTH_PT``) rather than guessing here,
+        so this module stays free of config imports."""
+        return _optional_float(value, minimum=0.0, maximum=100.0)
+
+
+class ImageElement(BaseElement):
+    """A region of the SOURCE image that cannot be drawn as a native object.
+
+    A photo, a rendered chart, a logo, a complex illustration: the backend crops
+    :attr:`bbox` out of the source image and places the crop there. It is the
+    escape hatch for the genuinely un-transcribable, NOT a way to flatten a
+    slide into a picture - see the anti-flattening rules in ``pptx_builder``.
+
+    ``description`` is a short human label (used by the preview), never a
+    transcription. A blank description normalizes to ``None`` so nothing has to
+    render an empty caption.
+    """
+
+    type: Literal["image"]
+    description: str | None = None
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _norm_description(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = (value if isinstance(value, str) else _cell_text(value)).strip()
+        return text or None
+
+
 Element = Annotated[
-    Union[ShapeElement, TableElement, TextElement],
+    Union[
+        ShapeElement,
+        TableElement,
+        TextElement,
+        ConnectorElement,
+        ImageElement,
+    ],
     Field(discriminator="type"),
 ]
 
@@ -714,7 +981,12 @@ class SlideSpec(BaseModel):
         return value
 
     def counts_by_type(self) -> dict[str, int]:
-        """``{"shape": 3, "table": 1, "text": 4}`` - handy for CLI summaries."""
+        """``{"shape": 3, "connector": 2, "text": 4}`` - handy for CLI summaries.
+
+        Keyed on the element's own ``type`` tag, so a bbox-less element
+        (``connector``) counts exactly like any other and a future type needs no
+        change here. Types absent from the slide are absent from the mapping.
+        """
         counts: dict[str, int] = {}
         for element in self.elements:
             counts[element.type] = counts.get(element.type, 0) + 1
@@ -725,13 +997,38 @@ class SlideSpec(BaseModel):
 # payload shape recovery (envelope keys / bare element arrays)
 # ---------------------------------------------------------------------------
 
-_ELEMENT_TYPE_NAMES = frozenset({"shape", "table", "text"})
+_ELEMENT_TYPE_NAMES = frozenset({"shape", "table", "text", "connector", "image"})
 _SPEC_KEYS = ("elements", "background_color")
+
+#: Keys only a connector ever carries. Used to recognize a connector that is
+#: missing its ``type`` AND one of its endpoints - which must still be seen as
+#: an ELEMENT so it can be dropped with a reason.
+_CONNECTOR_ONLY_KEYS = ("arrow_start", "arrow_end", "dash_style")
 
 
 def _looks_like_spec(value: Any) -> bool:
     """True when *value* is a mapping carrying a top-level SlideSpec key."""
     return isinstance(value, dict) and any(key in value for key in _SPEC_KEYS)
+
+
+def _looks_like_connector(value: dict) -> bool:
+    """True when *value* is plausibly a connector, which carries NO ``bbox``.
+
+    The bbox rule in :func:`_looks_like_element` structurally cannot recognize a
+    connector, so without this a bare top-level array of connectors whose
+    ``type`` the model spelled wrong (or omitted) would be unrecoverable: the
+    whole array would fail as a non-spec and every element - plus every
+    per-element reason - would be lost.
+
+    Both endpoints present is the clear case. ONE endpoint plus a
+    connector-only attribute is the half-broken case, and it must still be
+    recognized as an element: :func:`validate_elements` then drops it with a
+    reason naming the missing endpoint, which is the whole point.
+    """
+    endpoints = [key for key in ("start_point", "end_point") if key in value]
+    if len(endpoints) == 2:
+        return True
+    return bool(endpoints) and any(key in value for key in _CONNECTOR_ONLY_KEYS)
 
 
 def _looks_like_element(value: Any) -> bool:
@@ -742,7 +1039,9 @@ def _looks_like_element(value: Any) -> bool:
     if isinstance(kind, str) and kind.strip().lower() in _ELEMENT_TYPE_NAMES:
         return True
     # No usable "type", but the element-only keys are there.
-    return "bbox" in value and any(k in value for k in ("content", "data", "kind"))
+    if "bbox" in value and any(k in value for k in ("content", "data", "kind")):
+        return True
+    return _looks_like_connector(value)
 
 
 def _element_list(value: Any, *, permissive: bool = True) -> list | None:
@@ -892,6 +1191,10 @@ def llm_json_schema() -> dict:
         "[x, y, w, h] as integers 0..1000; x/w are relative to image width, "
         "y/h relative to image height"
     )
+    point_desc = (
+        "[x, y] as integers 0..1000; x relative to image width, y relative to "
+        "image height"
+    )
     return {
         "type": "object",
         "description": (
@@ -900,7 +1203,9 @@ def llm_json_schema() -> dict:
         ),
         "coordinate_system": (
             "Integers 0..1000 on BOTH axes (0,0 = top-left, 1000,1000 = "
-            "bottom-right). bbox is always [x, y, w, h]."
+            "bottom-right). bbox is always [x, y, w, h]. A connector has NO "
+            "bbox: it carries start_point and end_point, each [x, y] on the "
+            "same grid."
         ),
         "z_order": (
             "The 'elements' array is painted in order: put background and "
@@ -928,8 +1233,17 @@ def llm_json_schema() -> dict:
                                         "rectangle",
                                         "rounded_rectangle",
                                         "circle",
+                                        "arrow_right",
+                                        "arrow_left",
+                                        "arrow_up",
+                                        "arrow_down",
                                     ],
                                     "default": "rectangle",
+                                    "description": (
+                                        "arrow_* are BLOCK arrows (a thick "
+                                        "filled arrow body); a thin arrow "
+                                        "joining two boxes is a connector"
+                                    ),
                                 },
                                 "fill_color": {
                                     "type": ["string", "null"],
@@ -1003,6 +1317,81 @@ def llm_json_schema() -> dict:
                                 "align": {
                                     "enum": ["left", "center", "right"],
                                     "default": "left",
+                                },
+                            },
+                        },
+                        {
+                            "type": "object",
+                            "title": "connector",
+                            "description": (
+                                "a line or arrow JOINING two things; it has no "
+                                "bbox, only two endpoints"
+                            ),
+                            "required": ["type", "start_point", "end_point"],
+                            "properties": {
+                                "type": {"const": "connector"},
+                                "start_point": {
+                                    "type": "array",
+                                    "description": point_desc,
+                                },
+                                "end_point": {
+                                    "type": "array",
+                                    "description": point_desc,
+                                },
+                                "kind": {
+                                    "enum": ["straight", "elbow"],
+                                    "default": "straight",
+                                    "description": (
+                                        "'elbow' for a line that turns a right "
+                                        "angle on its way"
+                                    ),
+                                },
+                                "arrow_start": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": "arrowhead at start_point",
+                                },
+                                "arrow_end": {
+                                    "type": "boolean",
+                                    "default": True,
+                                    "description": "arrowhead at end_point",
+                                },
+                                "dash_style": {
+                                    "enum": ["solid", "dashed"],
+                                    "default": "solid",
+                                },
+                                "color": {
+                                    "type": ["string", "null"],
+                                    "description": "#RRGGBB hex for the line",
+                                },
+                                "width_pt": {
+                                    "type": ["number", "null"],
+                                    "description": "line width in points",
+                                },
+                            },
+                        },
+                        {
+                            "type": "object",
+                            "title": "image",
+                            "description": (
+                                "ONLY a region that cannot be drawn as shape, "
+                                "table or text - a photo, a rendered chart, a "
+                                "logo, a complex illustration. That region is "
+                                "cropped out of the source image. NEVER mark "
+                                "an ordinary box, text block or table as an "
+                                "image, and NEVER emit one image covering the "
+                                "whole slide."
+                            ),
+                            "required": ["type", "bbox"],
+                            "properties": {
+                                "type": {"const": "image"},
+                                "bbox": {"type": "array", "description": bbox_desc},
+                                "description": {
+                                    "type": ["string", "null"],
+                                    "description": (
+                                        "a few words naming what the region "
+                                        "shows, not a transcription"
+                                    ),
                                 },
                             },
                         },
