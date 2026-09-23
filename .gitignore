@@ -1,0 +1,32 @@
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# --- Secrets ----------------------------------------------------------------
+# The real key belongs in your shell; if you keep one in a file, keep it here.
+.env
+.env.local
+!.env.example
+
+# --- Node / frontend --------------------------------------------------------
+node_modules/
+frontend/dist/
+dist/
+.vite/
+frontend/.vite/
+npm-debug.log*
+yarn-error.log*
+.eslintcache
+
+# --- Build output -----------------------------------------------------------
+# Generated decks: every conversion writes one, none of them are source.
+*.pptx
+
+# --- Editors / OS -----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/

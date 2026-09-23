@@ -1,0 +1,162 @@
+"""Central configuration for the image-to-pptx Vision CLI.
+
+Holds LLM connection settings (LiteLLM proxy, OpenAI-compatible), slide geometry,
+the normalized coordinate scale used by the vision schema, supported input image
+formats and rendering defaults.
+
+This module is intentionally dependency-free at import time: ``openai`` is imported
+lazily inside :func:`get_client` so that every other module (and the test suite) can
+import ``config`` even when the OpenAI SDK is not installed.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never executed at runtime
+    import openai
+
+__all__ = [
+    "LITELLM_BASE_URL",
+    "LITELLM_API_KEY",
+    "MissingApiKeyError",
+    "DEFAULT_MODEL",
+    "LLM_TIMEOUT",
+    "LLM_MAX_RETRIES",
+    "SLIDE_WIDTH_IN",
+    "SLIDE_HEIGHT_IN",
+    "COORD_SCALE",
+    "SUPPORTED_EXTENSIONS",
+    "MIME_BY_EXTENSION",
+    "DEFAULT_TEXT_FONT_SIZE",
+    "DEFAULT_TABLE_FONT_SIZE",
+    "DEFAULT_BORDER_WIDTH_PT",
+    "get_client",
+]
+
+# --------------------------------------------------------------------------- #
+# LLM / LiteLLM proxy settings
+# --------------------------------------------------------------------------- #
+
+#: Base URL of the OpenAI-compatible LiteLLM proxy (env: ``LITELLM_BASE_URL``).
+LITELLM_BASE_URL: str = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000/")
+
+#: API key presented to the proxy (env: ``LITELLM_API_KEY``). There is
+#: deliberately NO default: a credential does not belong in the source tree, and
+#: a baked-in key also hides a misconfigured environment behind a 401 from the
+#: proxy. Empty means "not configured" - :func:`get_client` says so, by name,
+#: while ``--from-json`` never needs a key at all.
+LITELLM_API_KEY: str = os.environ.get("LITELLM_API_KEY", "")
+
+#: Vision model name routed by the proxy (env: ``VISION_MODEL``).
+DEFAULT_MODEL: str = os.environ.get("VISION_MODEL", "gemini-flash")
+
+#: Per-request timeout in seconds. Vision calls on large images are slow.
+LLM_TIMEOUT: float = 120.0
+
+#: How many times the SDK itself retries a failed request.
+LLM_MAX_RETRIES: int = 2
+
+# --------------------------------------------------------------------------- #
+# Slide geometry and coordinate system
+# --------------------------------------------------------------------------- #
+
+#: Slide width in inches (16:9 widescreen).
+SLIDE_WIDTH_IN: float = 13.333
+
+#: Slide height in inches (16:9 widescreen).
+SLIDE_HEIGHT_IN: float = 7.5
+
+#: The vision model reports bounding boxes as integers in ``0..COORD_SCALE`` on
+#: both axes; the builder maps that range onto the slide dimensions above.
+COORD_SCALE: int = 1000
+
+# --------------------------------------------------------------------------- #
+# Input image handling
+# --------------------------------------------------------------------------- #
+
+#: Image extensions the CLI accepts (lowercase, leading dot).
+SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+
+#: Extension -> MIME type, used to build the ``data:`` URL for the Vision payload.
+MIME_BY_EXTENSION: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+
+# --------------------------------------------------------------------------- #
+# Rendering defaults
+# --------------------------------------------------------------------------- #
+
+#: Fallback font size (pt) for text boxes when the model gives none.
+DEFAULT_TEXT_FONT_SIZE: int = 12
+
+#: Fallback font size (pt) for table cells. Deliberately compact: python-pptx
+#: tables cannot shrink below their content, so a large font makes a table
+#: outgrow the slide.
+DEFAULT_TABLE_FONT_SIZE: int = 10
+
+#: Fallback shape border width in points.
+DEFAULT_BORDER_WIDTH_PT: float = 1.0
+
+
+class MissingApiKeyError(RuntimeError):
+    """``LITELLM_API_KEY`` is unset or blank, so no client can be built.
+
+    A ``RuntimeError`` so existing callers that catch ``RuntimeError`` (or
+    ``Exception``) keep working unchanged; a distinct class so the CLI can
+    diagnose it by TYPE instead of by guessing at message text.
+    """
+
+
+#: The one message that explains a missing key, used by the error above.
+_MISSING_KEY_HINT = (
+    "LITELLM_API_KEY is not set (or is blank), so the LiteLLM proxy cannot be "
+    "called.\n"
+    "  Fix: export the key in your shell, then retry:\n"
+    "    export LITELLM_API_KEY='<your proxy key>'\n"
+    "  (see .env.example; keep the key in your environment, never in a file in "
+    "this repository)\n"
+    "  No key handy? '--from-json SPEC.json' builds a deck with no key and no "
+    "network at all."
+)
+
+
+def get_client() -> "openai.OpenAI":
+    """Build an OpenAI-compatible client pointed at the LiteLLM proxy.
+
+    ``openai`` is imported here rather than at module scope so that importing
+    ``config`` never fails when the SDK is missing.
+
+    The key is read from :data:`LITELLM_API_KEY` at call time (not at import
+    time) so that a test or a caller can set it on the module and get a client
+    that uses it.
+
+    Raises:
+        MissingApiKeyError: if ``LITELLM_API_KEY`` is unset or blank. Passing an
+            empty key to the SDK would either raise an opaque ``OpenAIError``
+            ("api_key client option must be set") or reach the proxy and come
+            back as a bare 401 - neither of which names the variable to set.
+        RuntimeError: if the ``openai`` package is not installed.
+    """
+    api_key = LITELLM_API_KEY
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise MissingApiKeyError(_MISSING_KEY_HINT)
+
+    try:
+        import openai
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise RuntimeError(
+            "The 'openai' package is required to talk to the LiteLLM proxy. "
+            "Install it with: pip install -r requirements.txt"
+        ) from exc
+
+    return openai.OpenAI(
+        base_url=LITELLM_BASE_URL,
+        api_key=api_key,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
