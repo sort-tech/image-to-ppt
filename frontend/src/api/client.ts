@@ -27,6 +27,29 @@ export const PPTX_MIME =
 /* Korean error copy                                                          */
 /* -------------------------------------------------------------------------- */
 
+interface ErrorCopy {
+  /** Replaces the server's `message` outright. */
+  message: string;
+  /** Replaces the server's `hint` - unless `keepServerDetail` says otherwise. */
+  hint: string;
+  /**
+   * Append the server's own `hint` under ours, separated by a blank line.
+   *
+   * Only for the codes whose hint carries specifics no Korean sentence written
+   * here can know: which element was rejected and why, which field of the
+   * request was missing, what the builder or the upstream model actually said.
+   * For every other code the server's hint is an English restatement of the
+   * line above it, and stacking the two made a Korean UI read as a
+   * half-translated one.
+   *
+   * The server's `message` is never appended, for any code: `message` here has
+   * already replaced it, so re-appending it printed the same sentence twice -
+   * once in Korean, once in English (`invalid_spec` showed "Spec JSON이
+   * 유효하지 않습니다." and then "The request body is not a usable SlideSpec.").
+   */
+  keepServerDetail?: true;
+}
+
 /**
  * Korean presentation text for the error codes the contract pins.
  *
@@ -35,7 +58,7 @@ export const PPTX_MIME =
  * own `message`/`hint`, so a new backend code still says something useful
  * instead of a generic shrug.
  */
-const ERROR_COPY: Record<string, { message: string; hint: string }> = {
+const ERROR_COPY: Record<string, ErrorCopy> = {
   unsupported_extension: {
     message: "지원하지 않는 이미지 형식입니다.",
     hint: "JPG, JPEG, PNG, WEBP 파일만 변환할 수 있습니다. 파일을 변환해서 다시 올려주세요.",
@@ -63,14 +86,17 @@ const ERROR_COPY: Record<string, { message: string; hint: string }> = {
   analysis_failed: {
     message: "Vision 모델이 이미지를 분석하지 못했습니다.",
     hint: "모델 응답을 슬라이드 정보로 읽을 수 없었습니다. 더 선명한 이미지로 바꾸거나 추가 지시사항에 원하는 요소를 적어 다시 시도해 보세요.",
+    keepServerDetail: true,
   },
   build_failed: {
     message: "PPTX 파일을 만드는 중 오류가 발생했습니다.",
     hint: "Spec JSON 탭에서 좌표나 색상 값을 확인한 뒤 다시 시도해 주세요.",
+    keepServerDetail: true,
   },
   invalid_spec: {
     message: "Spec JSON이 유효하지 않습니다.",
     hint: "아래 상세 내용에 어떤 요소가 왜 거부됐는지 나와 있습니다. 해당 부분을 고친 뒤 다시 시도해 주세요.",
+    keepServerDetail: true,
   },
   unknown_download: {
     message: "다운로드 링크가 만료되었습니다.",
@@ -82,7 +108,26 @@ const ERROR_COPY: Record<string, { message: string; hint: string }> = {
   },
   invalid_request: {
     message: "요청 형식이 올바르지 않습니다.",
-    hint: "아래 상세 내용을 확인해 주세요.",
+    hint: "요청 본문이 이 엔드포인트의 형식과 맞지 않습니다. 어떤 항목이 문제인지 아래에 나와 있습니다.",
+    keepServerDetail: true,
+  },
+  // Starlette's own failures, raised before any of our routes run. Their
+  // `message` is an English string like "Not Found" and their `hint` is empty,
+  // so without copy here the banner showed nothing but "Not Found" - the least
+  // useful message the UI can render, and the one a misconfigured
+  // `VITE_API_BASE` or dev proxy produces.
+  not_found: {
+    message: "요청한 주소를 찾을 수 없습니다.",
+    hint: "백엔드 주소 설정(VITE_API_BASE)이나 개발 서버 프록시 설정에서 `/api` 경로가 빠졌는지 확인해 주세요.",
+  },
+  method_not_allowed: {
+    message: "허용되지 않은 요청 방식입니다.",
+    hint: "백엔드와 프런트엔드 버전이 서로 다를 수 있습니다. 백엔드를 다시 시작한 뒤 페이지를 새로고침해 주세요.",
+  },
+  bad_request: {
+    message: "요청을 읽을 수 없습니다.",
+    hint: "업로드가 중간에 끊겼을 수 있습니다. 파일을 다시 선택해 변환해 주세요.",
+    keepServerDetail: true,
   },
 };
 
@@ -91,20 +136,25 @@ const ERROR_COPY: Record<string, { message: string; hint: string }> = {
  *
  * Unknown codes pass the server's own text through untouched: a wrong
  * translation is worse than an English sentence that is at least accurate.
- * A known code keeps the server's `hint` appended after ours, because that is
- * where the specific detail lives (which element was rejected, which
- * extension was seen).
+ *
+ * A known code shows Korean only, with one exception: the codes flagged
+ * `keepServerDetail` append the server's `hint`, because that is where the
+ * specifics live (which element was rejected and why, which field was
+ * missing). The server's `message` is never appended - `copy.message` has
+ * already replaced it, so appending it printed the same sentence twice, in two
+ * languages.
  */
 export function localizeApiError(detail: ApiError): ApiError {
+  const serverHint = detail.hint?.trim() ?? "";
   const copy = ERROR_COPY[detail.code];
-  if (!copy) return { ...detail, hint: detail.hint ?? null };
+  // `""` is what Starlette's envelopes carry; normalize it so the banner does
+  // not render an empty hint block.
+  if (!copy) return { ...detail, hint: serverHint || null };
 
-  const serverHint = detail.hint?.trim();
-  const serverMessage = detail.message.trim();
-  // Keep whatever specifics the server sent, below our own actionable line.
-  const extra = [serverHint, serverHint === serverMessage ? "" : serverMessage]
-    .filter((part): part is string => Boolean(part))
-    .join("\n");
+  const extra =
+    copy.keepServerDetail && serverHint && serverHint !== detail.message.trim()
+      ? serverHint
+      : "";
 
   return {
     code: detail.code,
@@ -180,7 +230,9 @@ export function toApiError(value: unknown): ApiRequestError {
 
 const NETWORK_HINT =
   "백엔드가 응답하지 않았습니다. backend 디렉터리에서 " +
-  "`uvicorn app.main:app --reload --port 8000` 으로 실행한 뒤 다시 시도해 주세요.";
+  // A Korean particle binds to the word before it with no space - including
+  // after a closing backtick.
+  "`uvicorn app.main:app --reload --port 8000`으로 실행한 뒤 다시 시도해 주세요.";
 
 /** Wraps fetch so a transport failure arrives as an ApiRequestError too. */
 async function request(path: string, init?: RequestInit): Promise<Response> {
@@ -272,10 +324,15 @@ function readEnvelope(parsed: unknown, status: number): ApiError | null {
       const msg = typeof issue.msg === "string" ? issue.msg : "invalid";
       return where ? `${where}: ${msg}` : msg;
     });
+    // One issue per line: the hint is rendered with `whitespace-pre-wrap`, and
+    // `ERROR_COPY.invalid_request` supplies the sentence around it, so this
+    // carries only the per-field detail. `message` is the fallback for a build
+    // where that entry has been removed - normally it is replaced, not shown,
+    // which is why it must not be a second phrasing of the same sentence.
     return {
       code: "invalid_request",
-      message: "요청이 유효하지 않아 거부되었습니다.",
-      hint: parts.join("; ") || null,
+      message: "요청 형식이 올바르지 않습니다.",
+      hint: parts.join("\n") || null,
     };
   }
 

@@ -15,6 +15,15 @@
 
   body {
     @apply bg-slate-950 text-slate-200 antialiased;
+    /* Korean typography: without `keep-all` the browser may break between any
+       two Hangul syllables, so every wrapped paragraph splits words in half
+       (measured at 375px: "이미지가" -> "이미지" / "가"). `break-word` keeps a
+       single over-long token from overflowing anyway. This does NOT weaken the
+       `[overflow-wrap:anywhere]` rules on the diagnostic lists and the error
+       hint - those still shrink min-content, so a 300-character junk token
+       cannot widen a grid track (verified: min-content 7px either way). */
+    word-break: keep-all;
+    overflow-wrap: break-word;
     background-image:
       radial-gradient(60rem 30rem at 15% -10%, rgba(56, 189, 248, 0.12), transparent 60%),
       radial-gradient(50rem 28rem at 95% 0%, rgba(168, 85, 247, 0.1), transparent 55%);

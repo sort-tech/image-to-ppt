@@ -566,7 +566,7 @@ Response headers:
 | header | value |
 | --- | --- |
 | `Content-Type` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` |
-| `Content-Disposition` | `attachment; filename="<name>.pptx"` |
+| `Content-Disposition` | `attachment; filename="<ascii-name>.pptx"`, plus `; filename*=UTF-8''<percent-encoded>` when the name is not ASCII |
 | `X-Element-Counts` | the counts object as a compact JSON string, e.g. `{"shape":0,"table":0,"text":1}` |
 | `X-Dropped-Count` | the number of dropped elements, as a string |
 
@@ -574,6 +574,24 @@ Response headers:
 round trip. Both custom headers - and `Content-Disposition` - are listed in the
 CORS `expose_headers`, so browser JS can read them cross-origin as well as
 through the proxy.
+
+`filename=` is latin-1 only, and the sanitizer that makes a name safe to
+interpolate there *removes* non-ASCII rather than escaping it - so on its own
+it turned `분기보고서.png` into `slide.pptx` and `매출표_Q3.png` into `Q3.pptx`.
+RFC 5987's `filename*` carries the user's own characters (UTF-8,
+percent-encoded) and is what browsers prefer, so the download keeps its name;
+a client that only understands `filename=` still gets the valid ASCII one. It
+is emitted **only** when it would say something `filename=` cannot, so an
+ASCII upload's header is exactly one parameter, as before.
+
+The JSON `filename` field of `POST /api/convert` is the same **display** name
+(the one the 변환 완료 panel shows and the browser falls back to), not the
+latin-1 one: it travels as UTF-8 JSON and ends up in an `<a download>`, so it
+has no latin-1 constraint, and having it disagree with the file the user
+actually saves would be its own bug. Path parts, quotes, control characters
+and the punctuation Windows forbids are still removed from it;
+`pptx_headers` is the only place the ASCII-only form is produced, and it
+derives both parameters itself rather than trusting a caller.
 
 ```bash
 curl -s -D /tmp/h.txt -o /tmp/rebuilt.pptx \
@@ -618,12 +636,21 @@ such as `..` is refused by the pattern, so it never reaches the store.
 | `GET /docs`, `GET /openapi.json` | FastAPI's interactive docs and schema |
 | `GET /` | a small JSON pointer to `/docs`, `/api/health` and the endpoint list, so the bare root is not a 404 |
 
-And one extra status you can hit from a client bug rather than a bad image:
+And a few extra statuses you can hit from a client bug rather than a bad image:
 **422 `invalid_request`** when the request itself cannot be read - `POST
 /api/convert` with no `file` part, say, where the `hint` is
 `file: Field required`. It uses the same envelope as everything else, because
 FastAPI's own `{"detail": [ ... ]}` list would otherwise be the one error shape
 a client had to special-case.
+
+The same envelope also wraps the failures starlette raises before any route of
+ours runs (`main._CODE_BY_STATUS`): **404 `not_found`** for a wrong URL - a
+`VITE_API_BASE` missing its `/api`, typically - **405
+`method_not_allowed`** for a wrong verb, and **400 `bad_request`** for a body
+the multipart parser cannot read. Their `message` is starlette's own English
+string and their `hint` is empty, so the UI supplies all the copy for them;
+`tests/test_frontend_guards.py` asserts every code in that map has Korean copy
+in `frontend/src/api/client.ts`.
 
 ---
 
@@ -830,8 +857,13 @@ $PY cli.py -i sample.png --extra "The right column is a 4-row table, not text."
 #    "Unknown model" under Troubleshooting for how to list them)
 $PY cli.py -i sample.png -m <another-model-your-proxy-serves> -o /tmp/other.pptx
 
-# 5. no proxy, no key, no network: prove the builder works from a saved spec
-$PY cli.py -i sample.png --save-json /tmp/spec.json -o /tmp/first.pptx
+# 5. no proxy, no key, no network: prove the builder works from a saved spec.
+#    `--from-json` is the one CLI path that calls no model, so it needs a spec
+#    file that already exists: either /tmp/slide.json from example 2, or - with
+#    no key at all, ever - seed one from the suite's spec fixture first.
+#    (app/mock_data.py is a TEST fixture, not a product feature; printing it is
+#    just the handiest keyless source of a valid spec.)
+$PY -c "from app import mock_data; print(mock_data.SAMPLE_SPEC_JSON)" > /tmp/spec.json
 $PY cli.py --from-json /tmp/spec.json -o /tmp/demo.pptx
 
 # 6. diagnose a bad run
@@ -879,22 +911,45 @@ Coverage highlights:
   aborting the build, and **the reopened deck containing no picture shapes and
   no `ppt/media/` parts**.
 - `tests/test_cli.py` - `--from-json`, `--save-json`, `--mock` being gone, flag
-  forwarding, exit codes (0/1/2), friendly errors without tracebacks, and the
-  Pillow sample-image generator.
+  forwarding, exit codes (0/1/2), friendly errors without tracebacks, the
+  Pillow sample-image generator, and a scan of **this README's own bash blocks**
+  asserting that no command sitting under a "no proxy / no key / no network"
+  promise is a `-i` vision conversion (which needs both).
 - `tests/test_config.py` - the API-key contract, and a scan of the **whole
   repository** (python and frontend sources alike) proving no key literal is
   committed.
 - `tests/test_api.py` - every endpoint and every error code against FastAPI's
   `TestClient`: the health payload's exact shape, `api_key_configured` never
   leaking the key, the one error envelope, `spec` never carrying `dropped`, the
-  download store's TTL / cap / re-download behaviour, and a `file_id` that is
-  not a uuid4 hex never reaching the store or the filesystem.
+  download store's TTL / cap / re-download behaviour, a `file_id` that is
+  not a uuid4 hex never reaching the store or the filesystem, the
+  `Content-Disposition` pair for a non-ASCII upload name, and a scan of
+  **`backend/` as a whole** (`cli.py` included - that is where `--mock` lived)
+  proving no module a user can reach imports the `mock_data` test fixture.
+- `tests/test_frontend_guards.py` - source-level guards for the frontend, in
+  the suite the project actually runs: the containment rules that keep an
+  unbounded backend string inside its column, and the Korean-UI rules -
+  `word-break: keep-all`, no particle detached from the word it binds to, no
+  bracketed either/or particle, no `0..1000` in Korean copy, and Korean copy
+  for **every** error code the backend can emit (the `ConversionFailure` codes
+  plus `main._CODE_BY_STATUS`, read live).
 
-Quick manual smoke test, no proxy required:
+Quick manual smoke test, no proxy and no key required. `--from-json` is the one
+CLI path that calls no model, so seed it from the suite's spec fixture and the
+whole build path - schema validation, native shapes/tables/text boxes, the 16:9
+slide - runs with no network at all:
 
 ```bash
-cd /Users/yan/works/image-to-ppt/backend && ../.venv/bin/python cli.py -i sample.png -o /tmp/demo.pptx && open /tmp/demo.pptx
+cd /Users/yan/works/image-to-ppt/backend \
+  && ../.venv/bin/python -c "from app import mock_data; print(mock_data.SAMPLE_SPEC_JSON)" > /tmp/spec.json \
+  && ../.venv/bin/python cli.py --from-json /tmp/spec.json -o /tmp/demo.pptx \
+  && open /tmp/demo.pptx
 ```
+
+To smoke-test the **model** path instead, `cli.py -i sample.png -o /tmp/demo.pptx`
+does the same thing end to end - but it needs `LITELLM_API_KEY` and a reachable
+LiteLLM proxy, and it writes no file at all if the analysis fails, so the
+`&& open` half never runs.
 
 ---
 

@@ -40,6 +40,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import quote
 
 from pydantic import ValidationError
 
@@ -69,6 +70,7 @@ __all__ = [
     "capture_stderr",
     "convert_upload",
     "counts_for",
+    "display_pptx_filename",
     "downloads",
     "preview_for",
     "failure_from_exception",
@@ -624,6 +626,14 @@ def counts_for(spec: SlideSpec) -> dict[str, int]:
 # --------------------------------------------------------------------------- #
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._ -]+")
 
+#: The same idea as :data:`_UNSAFE_FILENAME_CHARS`, but it keeps the letters.
+#:
+#: Only what could hurt goes: C0/C1 control characters (a CRLF is header
+#: injection), path separators, and the punctuation Windows forbids in a name.
+#: Hangul, kana, accents and the rest survive, because this value is
+#: percent-encoded into ``filename*`` rather than interpolated raw.
+_UNSAFE_DISPLAY_FILENAME_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f"\\/:;*?<>|]+')
+
 
 def supported_extensions() -> list[str]:
     """The accepted image extensions, sorted - as the contract lists them."""
@@ -642,6 +652,23 @@ def upload_extension(filename: str | None) -> str:
     return Path(name).suffix.lower()
 
 
+def _pptx_stem(filename: str | None) -> str:
+    """An upload's own stem: no directory part, no ``.pptx``/image suffix."""
+    raw = (filename or "").replace("\\", "/")
+    stem = Path(raw).name
+    if stem.lower().endswith(".pptx"):
+        return stem[: -len(".pptx")]
+    return Path(stem).stem
+
+
+def _tidy_stem(stem: str, default: str) -> str:
+    """Collapse the separators a substitution leaves behind."""
+    stem = re.sub(r"\s+", " ", stem)
+    stem = re.sub(r"[\s_]*_[\s_]*", "_", stem)  # "x_ evil_1" -> "x_evil_1"
+    stem = stem.strip(" ._-")
+    return stem or default
+
+
 def safe_pptx_filename(filename: str | None, *, default: str = "slide") -> str:
     """A ``*.pptx`` name derived from an upload's stem, safe in a header.
 
@@ -649,20 +676,27 @@ def safe_pptx_filename(filename: str | None, *, default: str = "slide") -> str:
     than escaped: this string is interpolated into ``Content-Disposition`` (which
     is latin-1 only and where a stray quote or CRLF would be header injection)
     and it is never used to touch the filesystem.
+
+    Because non-ASCII is *removed*, this alone loses a name written in any
+    non-Latin script entirely: ``분기보고서.png`` has no surviving character, so
+    it collapses to ``slide.pptx``, and ``매출표_Q3.png`` keeps only ``Q3``.
+    That is why :func:`display_pptx_filename` exists and why
+    :func:`pptx_headers` sends both.
     """
-    raw = (filename or "").replace("\\", "/")
-    stem = Path(raw).name
-    if stem.lower().endswith(".pptx"):
-        stem = stem[: -len(".pptx")]
-    else:
-        stem = Path(stem).stem
-    stem = _UNSAFE_FILENAME_CHARS.sub("_", stem)
-    stem = re.sub(r"\s+", " ", stem)
-    stem = re.sub(r"[\s_]*_[\s_]*", "_", stem)  # "x_ evil_1" -> "x_evil_1"
-    stem = stem.strip(" ._-")
-    if not stem:
-        stem = default
-    return f"{stem[:100]}.pptx"
+    stem = _UNSAFE_FILENAME_CHARS.sub("_", _pptx_stem(filename))
+    return f"{_tidy_stem(stem, default)[:100]}.pptx"
+
+
+def display_pptx_filename(filename: str | None, *, default: str = "slide") -> str:
+    """The same ``*.pptx`` name, with the upload's own letters kept.
+
+    This is the name the user recognises. It is NEVER interpolated into a header
+    as-is - :func:`pptx_headers` percent-encodes it into the RFC 5987
+    ``filename*`` parameter, which is UTF-8 and is what browsers prefer - so it
+    only has to survive being a filename on the client, not latin-1.
+    """
+    stem = _UNSAFE_DISPLAY_FILENAME_CHARS.sub("_", _pptx_stem(filename))
+    return f"{_tidy_stem(stem, default)[:100]}.pptx"
 
 
 def _shown_extension(extension: str, filename: str | None) -> str:
@@ -1255,10 +1289,29 @@ def pptx_headers(
 
     ``X-Element-Counts`` lets the UI report what it just downloaded without a
     second round trip, which is the whole reason it exists in the contract.
+
+    ``Content-Disposition`` carries the latin-1 ``filename=`` always, and adds
+    RFC 5987's ``filename*=UTF-8''...`` only when the name actually has
+    characters that ``filename=`` cannot spell. Without it every upload named in
+    Hangul (or any non-Latin script) downloaded as ``slide.pptx``; with it the
+    browser - which prefers ``filename*`` - saves ``분기보고서.pptx``, while a
+    client that only understands ``filename=`` still gets a valid ASCII name.
+    Emitting it only when it adds information keeps the header byte-identical
+    for the ASCII uploads that are the common case.
+
+    ``filename`` may already be a display name (the download store keeps one):
+    both parameters are re-derived here rather than trusted, so this is the one
+    place either form is produced and neither caller can get it wrong.
     """
     safe = safe_pptx_filename(filename)
+    disposition = f'attachment; filename="{safe}"'
+    shown = display_pptx_filename(filename)
+    if not shown.isascii():
+        # quote(safe="") percent-encodes every reserved character, so nothing
+        # here can introduce a quote, a semicolon or a CRLF into the header.
+        disposition += f"; filename*=UTF-8''{quote(shown, safe='')}"
     return {
-        "Content-Disposition": f'attachment; filename="{safe}"',
+        "Content-Disposition": disposition,
         "X-Element-Counts": json.dumps(counts or {}, separators=(",", ":")),
         "X-Dropped-Count": str(int(dropped_count)),
     }

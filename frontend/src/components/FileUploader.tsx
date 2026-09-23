@@ -83,15 +83,20 @@ export default function FileUploader({
       if (!candidate) return;
       const ext = extensionOf(candidate.name);
       if (!acceptedExtensions.includes(ext)) {
+        // The filename is interpolated at the END of its clause on purpose: a
+        // Korean particle binds to the word before it with no space, so none
+        // may follow a variable - and the bracketed either/or form that lets
+        // the reader pick the right one is a machine-translation artefact, not
+        // shipped copy.
         setRejection(
           ext
-            ? `"${candidate.name}" 은(는) 지원하지 않는 이미지 형식입니다. 지원 형식: ${acceptedExtensions.join(", ")}`
-            : `"${candidate.name}" 에는 확장자가 없습니다. ${acceptedExtensions.join(", ")} 중 하나로 끝나도록 이름을 바꿔 주세요 - ".png"가 아니라 "slide.png" 처럼요.`,
+            ? `지원하지 않는 이미지 형식입니다: "${candidate.name}". ${acceptedExtensions.join(", ")} 파일만 올릴 수 있습니다.`
+            : `파일 이름에 확장자가 없습니다: "${candidate.name}". ${acceptedExtensions.join(", ")} 중 하나로 끝나도록 이름을 바꿔 주세요(".png"가 아니라 "slide.png").`,
         );
         return;
       }
       if (candidate.size === 0) {
-        setRejection(`"${candidate.name}" 은(는) 비어 있습니다(0바이트). 실제 이미지를 선택해 주세요.`);
+        setRejection(`파일이 비어 있습니다(0바이트): "${candidate.name}". 실제 이미지를 선택해 주세요.`);
         return;
       }
       setRejection(null);

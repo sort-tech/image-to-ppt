@@ -26,7 +26,9 @@ from __future__ import annotations
 import copy
 import io
 import json
+import pathlib
 import time
+import urllib.parse
 import uuid
 import zipfile
 
@@ -354,10 +356,17 @@ class TestConvertHappyPath:
         self, client, png_bytes, offline_convert
     ):
         """The multipart encoder escapes most of this on the way in; whatever
-        survives must still be safe to interpolate into Content-Disposition."""
-        response = client.post(
-            "/api/convert", files=upload(png_bytes, name='ev"il\r\nX; q=1.png')
-        )
+        survives must still be safe to interpolate into Content-Disposition.
+
+        The JSON ``filename`` is the DISPLAY name (it is UTF-8 JSON and ends up
+        in an ``<a download>``, so it keeps the user's own letters), and the
+        header's ``filename=`` is the latin-1 form ``pptx_headers`` narrows it
+        to. Both have to be free of anything structural, which is what this
+        asserts - on the value the server actually produced, since the
+        multipart encoder percent-escapes some of this on the way in and the
+        server never sees the raw python string."""
+        hostile = 'ev"il\r\nX; q=1.png'
+        response = client.post("/api/convert", files=upload(png_bytes, name=hostile))
         assert response.status_code == 200
         filename = response.json()["filename"]
         assert filename.endswith(".pptx")
@@ -366,9 +375,26 @@ class TestConvertHappyPath:
         disposition = client.get(
             f"/api/download/{response.json()['download_id']}"
         ).headers["content-disposition"]
-        assert disposition == f'attachment; filename="{filename}"'
+        disposition.encode("latin-1")
+        assert "\r" not in disposition and "\n" not in disposition
         assert disposition.count('"') == 2
         assert disposition.count(";") == 1  # only the one separating the params
+        # This name is pure ASCII, so there is no second parameter to hide in.
+        assert "filename*" not in disposition
+
+        header_name = disposition.split('filename="', 1)[1].removesuffix('"')
+        assert header_name.endswith(".pptx")
+        assert header_name.isascii()
+        assert not set(header_name) & set('"\r\n;/\\')
+        # ...and it is exactly the documented derivation: the latin-1 narrowing
+        # of the display name, not some third value.
+        assert header_name == converter.safe_pptx_filename(filename)
+
+        # Independently, the sanitizer handles the raw string too - the
+        # encoder's escaping must not be what is keeping us safe.
+        for raw in (hostile, 'ev"il\r\nX; q=1'):
+            assert not set(converter.safe_pptx_filename(raw)) & set('"\r\n;/\\')
+            assert not set(converter.display_pptx_filename(raw)) & set('"\r\n;/\\')
 
 
 # =========================================================================== #
@@ -433,18 +459,49 @@ class TestMockModeIsGone:
         assert "is_mock" not in parameters
         assert {"model", "extra_instructions", "client"} <= set(parameters)
 
+    @staticmethod
+    def _product_modules() -> tuple[pathlib.Path, list[pathlib.Path]]:
+        """``backend/`` and every module in it a user can reach.
+
+        Rooted at ``backend/``, NOT at ``backend/app/``: ``--mock`` was a *CLI*
+        flag, so ``backend/cli.py`` is the single file this guard most needs to
+        look at - and a scan rooted at the package excluded it, along with
+        ``make_sample_image.py``. A ``--sample`` flag rebuilt on
+        ``mock_data.sample_spec()`` in ``cli.py`` passed the whole suite,
+        because nothing spelled "mock" and nothing scanned that file.
+        """
+        root = pathlib.Path(converter.__file__).resolve().parents[2]
+        product = [
+            path
+            for path in root.rglob("*.py")
+            if "mock_data" not in path.name
+            and "__pycache__" not in path.parts
+            and "tests" not in path.parts
+        ]
+        return root, product
+
+    def test_the_scan_reaches_the_cli_and_the_package(self):
+        """A guard that looks in the wrong place passes forever."""
+        root, product = self._product_modules()
+        assert root.name == "backend", f"scan root moved to {root}"
+        relative = {str(path.relative_to(root)) for path in product}
+        for expected in (
+            "cli.py",  # where --mock lived
+            "make_sample_image.py",
+            "app/services/converter.py",
+            "app/api/routes.py",
+            "app/main.py",
+        ):
+            assert expected in relative, f"{expected} is no longer scanned"
+        assert not any(
+            "tests" in path.parts for path in product
+        ), "the fixture's own test users must stay out of the product scan"
+
     def test_no_product_module_imports_the_fixture(self):
         """``app.mock_data`` stays as a TEST fixture. Nothing a user can reach
         may import it - that is the difference between a fixture and a
         feature."""
-        import pathlib
-
-        root = pathlib.Path(converter.__file__).resolve().parent.parent
-        product = [
-            path
-            for path in root.rglob("*.py")
-            if "mock_data" not in path.name and "__pycache__" not in path.parts
-        ]
+        root, product = self._product_modules()
         assert product, "found no product modules to scan"
         offenders = [
             str(path.relative_to(root))
@@ -891,6 +948,23 @@ class TestBuildFromJson:
         assert disposition.count(";") == 1
         assert "/" not in disposition.split("filename=")[1]
 
+    def test_a_hangul_filename_query_param_survives_the_round_trip(self, client):
+        """The Spec JSON tab's Download button sends the name it is showing. It
+        used to be sanitized twice - once in the route, once in
+        ``pptx_headers`` - so the non-ASCII was already gone before the header
+        was built and every such download was called "slide.pptx"."""
+        response = self.post(
+            client, spec_dict(), filename="분기보고서.pptx"
+        )
+        assert response.status_code == 200
+        disposition = response.headers["content-disposition"]
+        assert disposition.startswith('attachment; filename="slide.pptx"; ')
+        encoded = disposition.split("filename*=UTF-8''", 1)[1]
+        assert (
+            urllib.parse.unquote(encoded) == "분기보고서.pptx"
+        )
+        assert_native_deck(response.content)
+
     @pytest.mark.parametrize(
         "payload",
         [
@@ -986,6 +1060,43 @@ class TestDownload:
         assert json.loads(response.headers["x-element-counts"]) == body["counts"]
         assert response.headers["x-dropped-count"] == str(len(body["dropped"]))
         assert_native_deck(response.content)
+
+    def test_a_hangul_upload_name_reaches_the_download_header(
+        self, client, png_bytes, offline_convert
+    ):
+        """End to end: the store has to keep the user's own characters, because
+        the header is built from what it kept. Sanitizing on the way IN threw
+        them away, so a Korean-named upload was called "slide.pptx" both in the
+        response body the UI shows and in the saved file - for the very users
+        this UI is in Korean for."""
+        body = client.post(
+            "/api/convert",
+            files=upload(png_bytes, name="매출표_Q3.png"),
+        ).json()
+
+        disposition = client.get(f"/api/download/{body['download_id']}").headers[
+            "content-disposition"
+        ]
+        # The body carries the name the user recognises (UTF-8 JSON), and the
+        # header carries BOTH forms - the latin-1 fallback and the real one.
+        assert body["filename"] == "매출표_Q3.pptx"
+        assert disposition.startswith('attachment; filename="Q3.pptx"; ')
+        encoded = disposition.split("filename*=UTF-8''", 1)[1]
+        assert urllib.parse.unquote(encoded) == body["filename"]
+        disposition.encode("latin-1")
+        assert "\r" not in disposition and "\n" not in disposition
+
+    def test_an_ascii_upload_name_still_gets_the_one_parameter_header(
+        self, client, png_bytes, offline_convert
+    ):
+        body = client.post(
+            "/api/convert", files=upload(png_bytes, name="review-slide.png")
+        ).json()
+        disposition = client.get(f"/api/download/{body['download_id']}").headers[
+            "content-disposition"
+        ]
+        assert disposition == 'attachment; filename="review-slide.pptx"'
+        assert body["filename"] == "review-slide.pptx"
 
     def test_re_downloading_the_same_id_works(self, client, png_bytes, offline_convert):
         body = self._convert(client, png_bytes)
@@ -1195,6 +1306,85 @@ class TestConverterSeam:
         for name, value in core.items():
             assert counts[name] == value
         assert sum(counts.values()) == len(spec.elements)
+
+    # ----------------------------------------------------------------- #
+    # the non-ASCII half of the download name
+    # ----------------------------------------------------------------- #
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            # What safe_pptx_filename destroys and this has to keep.
+            ("분기버전.png", "분기버전.pptx"),
+            ("매출표_Q3.png", "매출표_Q3.pptx"),
+            ("2026 분기버전.png", "2026 분기버전.pptx"),
+            ("éèê.png", "éèê.pptx"),
+            # ...while the ASCII cases stay exactly what the header already said.
+            ("deck.png", "deck.pptx"),
+            ("deck.pptx", "deck.pptx"),
+            ("a/b/c/deck.jpeg", "deck.pptx"),
+            ("a\\b\\deck.webp", "deck.pptx"),
+            ("", "slide.pptx"),
+            (None, "slide.pptx"),
+            ("...", "slide.pptx"),
+        ],
+    )
+    def test_display_pptx_filename_keeps_the_users_own_letters(self, raw, expected):
+        assert converter.display_pptx_filename(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            'ev"il\r\nX; q=1.png',
+            "분기\r\n버전.png",
+            "a\x00b/../c.png",
+            "매출\u007f\u0085표.png",
+        ],
+    )
+    def test_the_display_name_still_carries_nothing_structural(self, raw):
+        """It is percent-encoded into the header, so a CRLF could not survive
+        anyway - but it also ends up as a filename on the client."""
+        name = converter.display_pptx_filename(raw)
+        assert not set(name) & set('"\\/:;*?<>|\r\n\x00')
+        assert name.endswith(".pptx")
+
+    def test_a_hangul_upload_gets_both_disposition_parameters(self):
+        """``filename=`` is latin-1 only, so a Hangul name had nowhere to go and
+        every such download was called "slide.pptx". RFC 5987's ``filename*``
+        is the parameter that carries it, and browsers prefer it."""
+        header = converter.pptx_headers(
+            "분기보고서.png", {"text": 1}, 0
+        )["Content-Disposition"]
+
+        # The latin-1 fallback is unchanged and still safe to put in a header.
+        assert header.startswith('attachment; filename="slide.pptx"; ')
+        header.encode("latin-1")
+        assert "\r" not in header and "\n" not in header
+        assert header.count('"') == 2
+
+        encoded = header.split("filename*=UTF-8''", 1)[1]
+        assert urllib.parse.unquote(encoded) == "분기보고서.pptx"
+
+    def test_an_ascii_upload_gets_exactly_the_header_it_always_did(self):
+        """``filename*`` is emitted only when it adds information, so the common
+        case is byte-identical - including for a hostile name, whose every
+        offending character is ASCII."""
+        for raw in ("sample.png", "my slide.jpg", 'ev"il\r\nX; q=1.png'):
+            header = converter.pptx_headers(raw, {}, 0)["Content-Disposition"]
+            assert "filename*" not in header
+            assert header.count(";") == 1
+            assert header == f'attachment; filename="{converter.safe_pptx_filename(raw)}"'
+
+    def test_a_hostile_hangul_name_cannot_inject_a_header(self):
+        """The one case where both parameters AND hostile input meet."""
+        header = converter.pptx_headers(
+            '분기"; x=1\r\nX-Evil: yes.png', {}, 0
+        )["Content-Disposition"]
+        header.encode("latin-1")
+        assert "\r" not in header and "\n" not in header
+        assert header.count('"') == 2
+        # The percent-encoded half contains no raw separator either.
+        encoded = header.split("filename*=UTF-8''", 1)[1]
+        assert not set(encoded) & set('";, \r\n')
 
     @pytest.mark.parametrize(
         ("raw", "expected"),

@@ -161,7 +161,16 @@ async def convert(
     except ConversionFailure as failure:
         raise _fail(failure) from None
 
-    filename = converter.safe_pptx_filename(file.filename)
+    # The DISPLAY name: the upload's own characters, path parts and anything
+    # structural removed. It is what the UI shows and what the store keeps,
+    # because ``pptx_headers`` needs those characters to emit RFC 5987's
+    # ``filename*`` - and it derives the latin-1 ``filename=`` itself, which is
+    # the only place the ASCII-only form is required. Sanitizing to ASCII here
+    # instead threw the characters away before either was built, so a Hangul
+    # upload was called "slide.pptx" in the panel AND in the saved file.
+    # Nothing downstream needs latin-1: this travels as UTF-8 JSON and ends up
+    # in an `<a download>` attribute.
+    filename = converter.display_pptx_filename(file.filename)
     counts = result.counts
     download_id = converter.downloads.put(
         result.pptx_bytes,
@@ -268,7 +277,11 @@ async def build_from_json(request: Request, filename: str = "slide.pptx") -> Res
 
     return _pptx_response(
         result.pptx_bytes,
-        converter.safe_pptx_filename(filename),
+        # Passed through unsanitized on purpose: ``pptx_headers`` derives BOTH
+        # the latin-1 ``filename=`` and the UTF-8 ``filename*`` from it, and
+        # sanitizing first would strip the non-ASCII characters the second one
+        # exists to carry. Nothing else uses this value.
+        filename,
         result.counts,
         len(result.dropped),
     )

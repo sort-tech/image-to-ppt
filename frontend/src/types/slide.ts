@@ -302,8 +302,22 @@ export type ApiErrorCode =
   | "invalid_spec"
   | "unknown_download"
   | "internal_error"
+  /** `RequestValidationError` - the body did not match the endpoint's shape. */
+  | "invalid_request"
+  /**
+   * Raised by the app-wide `HTTPException` handler for a failure Starlette
+   * itself produced, i.e. before any route of ours ran: a wrong URL or a wrong
+   * method (a stale `VITE_API_BASE` or dev-proxy target), or a body the
+   * multipart parser could not read. Their `message` is Starlette's English
+   * string and their `hint` is empty, so the UI has to supply all the copy.
+   */
+  | "not_found"
+  | "method_not_allowed"
+  | "bad_request"
   /** Raised client-side when the request never reached the server. */
   | "network_error"
+  /** Raised client-side when the caller aborted the request. */
+  | "aborted"
   /** Raised client-side for a response we could not interpret. */
   | "bad_response"
   | (string & {});

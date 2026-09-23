@@ -42,7 +42,9 @@ const FALLBACK_EXTENSIONS = [".jpeg", ".jpg", ".png", ".webp"];
 const PROGRESS = [
   "이미지를 업로드하는 중...",
   "Vision 모델이 레이아웃을 읽는 중...",
-  "요소를 0..1000 좌표계로 옮기는 중...",
+  // 0~1000, not 0..1000: `..` is programming-language range syntax, and a
+  // Korean sentence writes a range with ~.
+  "요소를 0~1000 좌표계로 옮기는 중...",
   "요소를 하나씩 검증하는 중...",
   "네이티브 도형·표·텍스트 상자를 그리는 중...",
   "미리보기를 만드는 중...",
@@ -320,7 +322,7 @@ export default function App() {
                 이미지 → 편집 가능한 PPTX 변환기
               </h1>
               <p className="mt-1 max-w-2xl text-sm text-slate-400">
-                Vision 모델이 이미지를 읽어 슬라이드 구성을 0..1000 좌표계로 정리하고, 그 결과를
+                Vision 모델이 이미지를 읽어 슬라이드 구성을 파악하고, 그 결과를
                 실제 도형·표·텍스트 상자로 그려 넣습니다. 납작하게 박힌 이미지가 아니라
                 PowerPoint에서 문구·색상·위치를 그대로 편집할 수 있는 슬라이드가 만들어집니다.
               </p>

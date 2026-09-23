@@ -920,3 +920,185 @@ def test_full_pipeline_on_a_generated_image_yields_no_pictures(tmp_path, monkeyp
     assert kinds["text"] == sum(1 for el in spec.elements if isinstance(el, TextElement))
     # ">=": the slide background may legitimately cost one extra autoshape.
     assert kinds["shape"] >= sum(1 for el in spec.elements if isinstance(el, ShapeElement))
+
+
+# =========================================================================== #
+# the README's own keyless recipes
+# =========================================================================== #
+README = Path(__file__).resolve().parents[2] / "README.md"
+
+#: A promise that a command needs no proxy / key / network.
+KEYLESS_CLAIM = re.compile(r"no\s+(?:proxy|key|network)", re.I)
+
+#: An invocation that calls the vision model, i.e. the ONE CLI path that needs
+#: ``LITELLM_API_KEY`` and a reachable proxy.
+VISION_CALL = re.compile(r"cli\.py\b[^\n]*(?:\s-i\s|\s--input\s)")
+
+readme_exists = pytest.mark.skipif(
+    not README.is_file(), reason="README.md is not present in this checkout"
+)
+
+
+def _bash_blocks(text: str) -> list[tuple[list[str], list[str]]]:
+    """``(the paragraph immediately above, the block's lines)`` per bash fence.
+
+    The "paragraph immediately above" is the run of non-empty lines touching
+    the fence - that is the sentence a reader takes as describing the command,
+    and it is where "no proxy required" lived. Prose further up is not
+    considered, so an unrelated mention of "no key" three paragraphs earlier
+    cannot govern a command.
+    """
+    lines = text.splitlines()
+    blocks: list[tuple[list[str], list[str]]] = []
+    index = 0
+    while index < len(lines):
+        if lines[index].strip().startswith("```bash"):
+            start = index + 1
+            end = start
+            while end < len(lines) and not lines[end].strip().startswith("```"):
+                end += 1
+            cursor = start - 2
+            while cursor >= 0 and not lines[cursor].strip():  # the blank line(s)
+                cursor -= 1
+            lead: list[str] = []
+            while cursor >= 0 and lines[cursor].strip():
+                lead.insert(0, lines[cursor])
+                cursor -= 1
+            blocks.append((lead, lines[start:end]))
+            index = end
+        index += 1
+    return blocks
+
+
+def _keyless_commands(text: str | None = None) -> list[tuple[str, str]]:
+    """``(the claim, the command)`` for every command a keyless promise covers.
+
+    Inside a block, a RUN of ``#`` comment lines governs the commands beneath
+    it (a run, not the last line: example 5's promise is on the first of six
+    comment lines, and taking only the nearest one read the promise off the
+    wrong sentence). Before the first comment, the lead paragraph governs.
+    """
+    if text is None:
+        text = README.read_text(encoding="utf-8")
+    governed: list[tuple[str, str]] = []
+    for lead, body in _bash_blocks(text):
+        lead_claim = "\n".join(lead)
+        comments: list[str] = []
+        start_new = True
+        for line in body:
+            stripped = line.strip()
+            if not stripped:
+                start_new = True
+                continue
+            if stripped.startswith("#"):
+                if start_new:
+                    comments = [stripped]
+                    start_new = False
+                else:
+                    comments.append(stripped)
+                continue
+            claim = "\n".join(comments) if comments else lead_claim
+            if KEYLESS_CLAIM.search(claim):
+                governed.append((claim, stripped))
+            start_new = True
+    return governed
+
+
+@readme_exists
+class TestTheReadmesKeylessRecipesReallyAreKeyless:
+    """Two recipes promised keylessness and then ran a vision conversion.
+
+    When ``--mock`` was removed from the docs the flag was swapped for
+    ``-i sample.png`` but the promise above it was left alone, so "Quick manual
+    smoke test, no proxy required" and "# 5. no proxy, no key, no network" both
+    became false - and because a failed analysis writes no file, the ``&& open``
+    half never ran and example 5's second line then failed too ("JSON spec not
+    found"). This is the first thing a new contributor runs.
+    """
+
+    def test_the_scan_finds_the_recipes(self):
+        governed = _keyless_commands()
+        assert governed, "no keyless promise found in the README - re-point this"
+        assert any("--from-json" in command for _, command in governed)
+
+    def test_no_keyless_promise_covers_a_vision_command(self):
+        offenders = [
+            f"{claim.strip()!r} -> {command!r}"
+            for claim, command in _keyless_commands()
+            if VISION_CALL.search(command)
+        ]
+        assert offenders == [], (
+            "a command that needs LITELLM_API_KEY and a reachable proxy sits "
+            f"under a promise that it needs neither: {offenders}"
+        )
+
+    def test_the_guard_can_actually_fail(self):
+        assert VISION_CALL.search("$PY cli.py -i sample.png -o /tmp/first.pptx")
+        assert VISION_CALL.search("../.venv/bin/python cli.py -i sample.png -o x.pptx")
+        assert not VISION_CALL.search("$PY cli.py --from-json /tmp/spec.json -o x.pptx")
+        assert KEYLESS_CLAIM.search("Quick manual smoke test, no proxy required:")
+        assert KEYLESS_CLAIM.search("# 5. no proxy, no key, no network: prove it")
+        assert not KEYLESS_CLAIM.search("# 1. the happy path")
+
+    def test_every_keyless_command_is_one_the_cli_can_really_run_offline(self):
+        """Each keyless line must either build from a spec or produce one - the
+        recipe has to be self-contained, or step 2 fails on the file step 1
+        never wrote."""
+        for claim, command in _keyless_commands():
+            if "cli.py" not in command:
+                continue
+            assert "--from-json" in command, (
+                f"{command!r} is offered as keyless but is not the --from-json "
+                f"path (claim: {claim.strip()!r})"
+            )
+
+    def test_the_smoke_test_recipe_runs_end_to_end_with_no_key(self, tmp_path, monkeypatch):
+        """Not a source assertion: this actually performs what the README's
+        smoke test does - seed a spec from the fixture, then build from it with
+        no key in the environment at all."""
+        monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+        monkeypatch.setattr(config, "LITELLM_API_KEY", "", raising=False)
+
+        spec_path = tmp_path / "spec.json"
+        spec_path.write_text(mock_data.SAMPLE_SPEC_JSON, encoding="utf-8")
+        out = tmp_path / "demo.pptx"
+
+        assert _run(["--from-json", str(spec_path), "-o", str(out)]) == 0
+        assert out.is_file(), "the README's smoke test wrote no deck"
+        assert len(Presentation(str(out)).slides) == 1
+
+    def test_the_guard_catches_the_text_it_was_written_for(self):
+        """The exact two recipes that shipped broken, fed through the scanner
+        without touching the real README - a guard nobody has seen fail is a
+        guard nobody knows works."""
+        broken = "\n".join(
+            [
+                "Quick manual smoke test, no proxy required:",
+                "",
+                "```bash",
+                "cd backend && ../.venv/bin/python cli.py -i sample.png "
+                "-o /tmp/demo.pptx && open /tmp/demo.pptx",
+                "```",
+                "",
+                "Examples:",
+                "",
+                "```bash",
+                "# 5. no proxy, no key, no network: prove the builder works "
+                "from a saved spec",
+                "$PY cli.py -i sample.png --save-json /tmp/spec.json "
+                "-o /tmp/first.pptx",
+                "$PY cli.py --from-json /tmp/spec.json -o /tmp/demo.pptx",
+                "```",
+            ]
+        )
+        flagged = [
+            command
+            for _, command in _keyless_commands(broken)
+            if VISION_CALL.search(command)
+        ]
+        assert len(flagged) == 2, (
+            "the scanner no longer reports the two commands this guard exists "
+            f"for: {flagged}"
+        )
+        # ...and the honest half of the old example is NOT flagged.
+        assert all("--save-json" in c or "-o /tmp/demo.pptx &&" in c for c in flagged)

@@ -9,6 +9,13 @@ this module. It stays because it is the suite's one canonical SlideSpec:
 ``tests/test_api.py`` and ``tests/test_cli.py`` build their decks and their
 fake model replies from. Deleting it would delete that fixture, not a feature.
 
+``tests/test_api.py::TestMockModeIsGone`` enforces that, scanning the whole of
+``backend/`` - ``cli.py`` included, because ``--mock`` was a CLI flag - for an
+import of this module. The README's keyless smoke test prints
+:data:`SAMPLE_SPEC_JSON` from the *shell* to seed a spec file, which is a
+contributor using the fixture directly and not a product code path importing
+it; that is the line the guard draws.
+
 Nothing in here touches the network or the filesystem.  The single source of
 truth is :data:`_SPEC_DICT`; both :func:`sample_spec` (a validated
 :class:`schemas.SlideSpec`) and :data:`SAMPLE_SPEC_JSON` (the raw JSON string)

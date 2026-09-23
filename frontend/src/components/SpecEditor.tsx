@@ -29,6 +29,14 @@ interface SpecEditorProps {
 
 interface ParseState {
   ok: boolean;
+  /**
+   * Why the buffer is not usable yet.
+   *
+   * An empty editor is not a JSON error, and labelling it as one produced the
+   * run-on "JSON 오류 편집기가 비어 있습니다.". The status line branches on this
+   * instead of gluing one fixed label onto both cases.
+   */
+  kind: "ok" | "empty" | "syntax";
   error: string | null;
   value: unknown;
 }
@@ -36,17 +44,18 @@ interface ParseState {
 function parse(text: string): ParseState {
   const trimmed = text.trim();
   if (!trimmed) {
-    return { ok: false, error: "편집기가 비어 있습니다.", value: null };
+    return { ok: false, kind: "empty", error: null, value: null };
   }
   try {
-    return { ok: true, error: null, value: JSON.parse(trimmed) as unknown };
+    return { ok: true, kind: "ok", error: null, value: JSON.parse(trimmed) as unknown };
   } catch (err) {
     return {
       ok: false,
+      kind: "syntax",
       // The engine's own parse message names the offending position, which is
-      // the only genuinely useful part - so it is shown as-is rather than
-      // replaced with a vaguer Korean sentence.
-      error: err instanceof Error ? err.message : "JSON 형식이 올바르지 않습니다.",
+      // the only genuinely useful part - so it is kept verbatim as the DETAIL,
+      // introduced by a Korean sentence rather than standing in for one.
+      error: err instanceof Error ? err.message : null,
       value: null,
     };
   }
@@ -190,11 +199,22 @@ export default function SpecEditor({
             <CircleCheck aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             올바른 JSON입니다
           </>
+        ) : state.kind === "empty" ? (
+          <>
+            <CircleAlert aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0">편집기가 비어 있습니다. Spec JSON을 붙여 넣어 주세요.</span>
+          </>
         ) : (
           <>
             <CircleAlert aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span className="min-w-0">
-              JSON 오류 <span className="font-mono [overflow-wrap:anywhere]">{state.error}</span>
+              JSON 형식 오류입니다.
+              {state.error ? (
+                <>
+                  {" 브라우저 메시지: "}
+                  <span className="font-mono [overflow-wrap:anywhere]">{state.error}</span>
+                </>
+              ) : null}
             </span>
           </>
         )}
