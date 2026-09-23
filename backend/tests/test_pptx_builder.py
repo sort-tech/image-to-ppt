@@ -1409,6 +1409,7 @@ class TestFlatteningReport:
             "violations",
             "slide_count",
             "picture_count",
+            "unreadable_picture_count",
             "slides",
         }
         assert set(report["slides"][0]) == {
@@ -1417,9 +1418,14 @@ class TestFlatteningReport:
             "native_count",
             "picture_area_pct",
             "full_bleed_count",
+            "unreadable_picture_count",
             "flattened",
             "violations",
         }
+        # A picture whose bytes cannot be resolved is a deck PowerPoint offers
+        # to repair, and every other number in the report reads normally on
+        # one - so the count is part of the pinned shape, not an extra.
+        assert report["unreadable_picture_count"] == 0
 
     def test_a_deck_with_no_pictures_is_not_flattened(self):
         report = flattening_report(build_presentation(mock_data.sample_spec()))
@@ -1927,3 +1933,419 @@ class TestBuildPptx:
         ]
         assert multi, "the multi-line textbox collapsed into one paragraph"
         assert any("latency" in s.text_frame.text for s in multi)
+
+
+# ---------------------------------------------------------------------------
+# dropping one picture must never break another (shared image relationships)
+# ---------------------------------------------------------------------------
+def _flat_source(size=(1200, 800), color=(250, 250, 250)) -> bytes:
+    """A FLAT source, so two equal-sized crops of it are byte-identical.
+
+    That is the whole point of these tests: identical bytes are de-duplicated by
+    python-pptx into one image part with one relationship id, shared by both
+    pictures. A white document scan or a solid-colour deck produces it without
+    any duplicate elements in the spec.
+    """
+    return _source_bytes(Image.new("RGB", size, color))
+
+
+def _package(path) -> tuple[list[str], list[str], list[str]]:
+    """``(r:embed ids in slide1.xml, ids declared in its .rels, media parts)``."""
+    with zipfile.ZipFile(path) as archive:
+        slide = archive.read("ppt/slides/slide1.xml").decode("utf-8")
+        rels = archive.read("ppt/slides/_rels/slide1.xml.rels").decode("utf-8")
+        media = [n for n in archive.namelist() if n.startswith("ppt/media/")]
+    return (
+        re.findall(r'r:embed="([^"]+)"', slide),
+        re.findall(r'Id="([^"]+)"', rels),
+        media,
+    )
+
+
+class TestDroppingOnePictureNeverBreaksAnother:
+    """A rejected crop may not take a surviving crop's bytes with it.
+
+    python-pptx de-duplicates image parts by SHA-1 and hands the SAME ``rId`` to
+    every picture with the same bytes, and its own ``drop_rel`` counts ``//@r:id``
+    only - never the ``r:embed`` a picture actually uses - so it used to pop a
+    shared relationship unconditionally. The survivor's ``<a:blip r:embed>`` then
+    pointed at nothing and ``ppt/media`` was empty: the OPC violation PowerPoint
+    answers with its repair prompt, served with a 200 and a warning saying the
+    file was fine. Every assertion here is about the SAVED package, because that
+    is the artefact the user opens.
+    """
+
+    #: Two equal-sized halves of a flat source: identical bytes, and their union
+    #: covers 90% of the slide, so rule 2 has to drop one of them.
+    SPEC = {
+        "elements": [
+            {"type": "text", "bbox": [0, 0, 400, 40], "content": "캡션"},
+            {"type": "image", "bbox": [0, 50, 500, 900]},
+            {"type": "image", "bbox": [500, 50, 500, 900]},
+        ]
+    }
+
+    def test_the_premise_two_identical_crops_really_do_share_one_relationship(self):
+        """If this ever stops being true the rest of the class is testing air."""
+        prs, slide = _blank_deck()
+        source = _flat_source()
+        first = add_picture(slide, ImageElement(type="image", bbox=[0, 50, 500, 900]), source)
+        second = add_picture(slide, ImageElement(type="image", bbox=[500, 50, 500, 900]), source)
+        assert first._element.blip_rId == second._element.blip_rId
+
+    def test_a_rule_2_drop_leaves_every_embed_resolvable(self, tmp_path, capsys):
+        out = build_pptx(
+            SlideSpec.model_validate(self.SPEC), tmp_path / "dup.pptx", _flat_source()
+        )
+        assert "was NOT rendered" in capsys.readouterr().err, "rule 2 must have fired"
+
+        embeds, declared, media = _package(out)
+        assert embeds, "a picture survived, so it must reference its bytes"
+        assert [e for e in embeds if e not in declared] == [], (
+            f"dangling r:embed: {embeds} vs {declared} - PowerPoint would offer "
+            "to repair this file"
+        )
+        assert media, "the surviving picture's bytes must be in the package"
+
+    def test_the_surviving_pictures_bytes_can_still_be_read_back(self, tmp_path, capsys):
+        out = build_pptx(
+            SlideSpec.model_validate(self.SPEC), tmp_path / "dup2.pptx", _flat_source()
+        )
+        capsys.readouterr()
+        slide = Presentation(str(out)).slides[0]
+        pictures = _pictures(slide)
+        assert len(pictures) == 1
+        assert pictures[0].image.blob, "the survivor's image part is gone"
+
+    def test_the_report_counts_no_unreadable_picture(self, tmp_path, capsys):
+        out = build_pptx(
+            SlideSpec.model_validate(self.SPEC), tmp_path / "dup3.pptx", _flat_source()
+        )
+        capsys.readouterr()
+        report = flattening_report(Presentation(str(out)))
+        assert report["unreadable_picture_count"] == 0, report
+        assert report["flattened"] is False, report["violations"]
+
+    def test_three_identical_crops_survive_two_drops(self, tmp_path, capsys):
+        """One drop used to break every other picture sharing the relationship."""
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "text", "bbox": [0, 0, 400, 40], "content": "캡션"},
+                    {"type": "image", "bbox": [0, 60, 330, 900]},
+                    {"type": "image", "bbox": [335, 60, 330, 900]},
+                    {"type": "image", "bbox": [670, 60, 330, 900]},
+                ]
+            }
+        )
+        out = build_pptx(spec, tmp_path / "dup4.pptx", _flat_source())
+        capsys.readouterr()
+        embeds, declared, media = _package(out)
+        assert [e for e in embeds if e not in declared] == []
+        assert flattening_report(Presentation(str(out)))["unreadable_picture_count"] == 0
+        assert len(media) == 1, "identical bytes are one part, however many pictures"
+
+    def test_dropping_every_picture_really_releases_the_bytes(self, tmp_path, capsys):
+        """The other half of the contract: a refused crop must not ship unused."""
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "text", "bbox": [0, 940, 300, 50], "content": "캡션"},
+                    {"type": "image", "bbox": [0, 0, 1000, 1000]},
+                    {"type": "image", "bbox": [0, 0, 1000, 1000]},
+                ]
+            }
+        )
+        out = build_pptx(spec, tmp_path / "none.pptx", _flat_source())
+        err = capsys.readouterr().err
+        embeds, _declared, media = _package(out)
+        assert embeds == [] and media == [], (
+            "both crops were refused, so neither the pictures nor their bytes "
+            "may be in the package"
+        )
+        assert "carries its bytes" not in err, (
+            "the old message claimed the opposite of what the package shows: "
+            f"{err}"
+        )
+
+    def test_a_kept_pair_of_identical_crops_is_untouched(self, tmp_path, capsys):
+        """Nothing is dropped here - the fix may not cost the healthy case."""
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "text", "bbox": [0, 0, 400, 40], "content": "캡션"},
+                    {"type": "image", "bbox": [0, 100, 300, 300]},
+                    {"type": "image", "bbox": [600, 100, 300, 300]},
+                ]
+            }
+        )
+        out = build_pptx(spec, tmp_path / "kept.pptx", _flat_source())
+        assert capsys.readouterr().err == "", "nothing needed adjusting"
+        embeds, declared, media = _package(out)
+        assert len(embeds) == 2 and len(set(embeds)) == 1, "one shared relationship"
+        assert [e for e in embeds if e not in declared] == []
+        assert len(media) == 1
+        slide = Presentation(str(out)).slides[0]
+        assert all(picture.image.blob for picture in _pictures(slide))
+
+
+# ---------------------------------------------------------------------------
+# rule 2 measures the UNION of the picture boxes, not their sum
+# ---------------------------------------------------------------------------
+class TestPictureAreaIsTheUnionNotTheSum:
+    """``picture_area_pct`` is a claim about the slide, so it has to be true.
+
+    Summing the boxes double-counted every overlap: two copies of one 45% region
+    - the classic vision-model repetition - read as 90% and cost a picture that
+    should have been kept, with a warning quoting a coverage the deck never had.
+    Three stacked crops reported 135%, which cannot exist.
+    """
+
+    def _report(self, *bboxes, text=True):
+        elements = []
+        if text:
+            elements.append({"type": "text", "bbox": [0, 0, 300, 40], "content": "캡션"})
+        elements += [{"type": "image", "bbox": list(b)} for b in bboxes]
+        prs = build_presentation(
+            SlideSpec.model_validate({"elements": elements}), _flat_source()
+        )
+        return prs, flattening_report(prs)
+
+    def test_two_copies_of_one_region_are_counted_once(self, capsys):
+        prs, report = self._report([0, 0, 1000, 450], [0, 0, 1000, 450])
+        assert capsys.readouterr().err == "", "45% of the slide needs no drop"
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(45.0, abs=0.5)
+        assert report["picture_count"] == 2, "neither copy should have been dropped"
+        assert report["flattened"] is False, report["violations"]
+
+    def test_stacked_crops_can_never_report_more_than_the_slide(self, capsys):
+        prs, report = self._report(
+            [0, 0, 1000, 450], [0, 0, 1000, 450], [0, 0, 1000, 450]
+        )
+        capsys.readouterr()
+        assert report["slides"][0]["picture_area_pct"] <= 100.0
+
+    def test_an_overlapping_photo_and_chart_are_both_kept(self, capsys):
+        """A collage or a chart laid over a photo is a legitimate layout."""
+        prs, report = self._report([0, 0, 1000, 500], [0, 0, 680, 500])
+        assert "was NOT rendered" not in capsys.readouterr().err
+        assert report["picture_count"] == 2
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(50.0, abs=0.5)
+
+    def test_tiles_that_really_do_cover_the_slide_still_trip_the_rule(self, capsys):
+        """No overlap, so union == sum: the rule this closes must still fire."""
+        prs, report = self._report(
+            [0, 0, 500, 500], [500, 0, 500, 500], [0, 500, 500, 500], [500, 500, 500, 500]
+        )
+        err = capsys.readouterr().err
+        assert err.count("was NOT rendered") >= 1, err
+        assert report["flattened"] is False, "the enforcer fixed it before saving"
+
+    def test_the_warning_quotes_the_coverage_the_slide_really_had(self, capsys):
+        """Two identical halves: 90% covered, and the message must say 90%."""
+        build_presentation(
+            SlideSpec.model_validate(TestDroppingOnePictureNeverBreaksAnother.SPEC),
+            _flat_source(),
+        )
+        err = capsys.readouterr().err
+        assert "would cover 90% of the slide" in err, err
+
+    def test_a_picture_reaching_past_the_slide_is_clipped_not_over_counted(self):
+        """The union is measured on the slide, so off-slide area cannot inflate it."""
+        prs, slide = _blank_deck()
+        add_textbox(slide, TextElement(type="text", bbox=[0, 0, 100, 50], content="hi"))
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=[0, 0, 500, 500]), _flat_source()
+        )
+        picture.width = int(prs.slide_width * 2)  # deliberately off-slide
+        report = flattening_report(prs)
+        assert report["slides"][0]["picture_area_pct"] <= 100.0
+        assert report["slides"][0]["picture_area_pct"] == pytest.approx(50.0, abs=0.5)
+
+
+# ---------------------------------------------------------------------------
+# EXIF orientation: the crop has to come from the frame the bbox was measured in
+# ---------------------------------------------------------------------------
+def _exif_jpeg(orientation: int) -> bytes:
+    """The four-quadrant image as a JPEG carrying an EXIF Orientation tag."""
+    image = _source_image()
+    exif = image.getexif()
+    exif[0x0112] = orientation
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", exif=exif, quality=95)
+    return buffer.getvalue()
+
+
+class TestAnExifRotatedSourceIsCroppedAsItIsDisplayed:
+    """A bbox is measured in the DISPLAYED frame, so the crop must be too.
+
+    The browser shows the upload in an ``<img>``, which applies EXIF
+    Orientation, and the vision provider decodes the same bytes the same way.
+    Pillow does not: it hands back the STORED grid. For Orientation=6 - an
+    ordinary portrait phone photo - the two are transposed, so "the top-left
+    region" pointed at a completely different part of the picture and the deck
+    embedded the wrong crop with no warning at all.
+    """
+
+    def _crop(self, orientation: int, bbox) -> Image.Image:
+        prs, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=list(bbox)), _exif_jpeg(orientation)
+        )
+        return _embedded_crop(picture)
+
+    def _displayed(self, orientation: int) -> Image.Image:
+        from PIL import ImageOps
+
+        return ImageOps.exif_transpose(Image.open(io.BytesIO(_exif_jpeg(orientation))))
+
+    @pytest.mark.parametrize("orientation", [1, 3, 6, 8])
+    def test_the_crop_matches_the_displayed_top_left_quadrant(self, orientation):
+        crop = self._crop(orientation, [0, 0, 500, 500])
+        shown = self._displayed(orientation)
+        expected = shown.crop(
+            (0, 0, round(shown.width / 2), round(shown.height / 2))
+        ).convert("RGB")
+        assert crop.size == expected.size, (
+            f"orientation {orientation}: the crop was taken from the stored grid"
+        )
+        centre = (crop.width // 2, crop.height // 2)
+        # JPEG is lossy, so compare the dominant channel rather than exact RGB.
+        assert crop.getpixel(centre)[:3] == pytest.approx(
+            expected.getpixel(centre)[:3], abs=12
+        ), f"orientation {orientation}: a different region of the photo was embedded"
+
+    def test_an_image_with_no_exif_tag_is_untouched(self):
+        prs, slide = _blank_deck()
+        picture = add_picture(
+            slide,
+            ImageElement(type="image", bbox=QUADRANT_BBOX["top_left"]),
+            _source_bytes(),
+        )
+        assert _colors(_embedded_crop(picture)) == {QUADRANTS["top_left"][1]}
+
+    def test_a_portrait_photo_crops_the_band_the_model_pointed_at(self):
+        """The realistic case: a banner across the top of an upright photo."""
+        upright = Image.new("RGB", (600, 800), (255, 255, 255))
+        upright.paste(Image.new("RGB", (600, 100), (255, 0, 0)), (0, 0))
+        stored = upright.transpose(Image.Transpose.ROTATE_90)  # what a phone writes
+        exif = stored.getexif()
+        exif[0x0112] = 6
+        buffer = io.BytesIO()
+        stored.save(buffer, format="JPEG", exif=exif, quality=95)
+
+        prs, slide = _blank_deck()
+        picture = add_picture(
+            slide, ImageElement(type="image", bbox=[0, 0, 1000, 125]), buffer.getvalue()
+        )
+        crop = _embedded_crop(picture)
+        assert crop.size == (600, 100), crop.size
+        reds = sum(
+            count
+            for count, pixel in (crop.getcolors(maxcolors=1 << 24) or [])
+            if pixel[0] > 200 and pixel[1] < 80
+        )
+        assert reds > crop.width * crop.height * 0.9, (
+            "the banner the analyzer pointed at is not what was embedded"
+        )
+
+
+# ---------------------------------------------------------------------------
+# an image description is cleaned like any other text, and the cleaning is said
+# ---------------------------------------------------------------------------
+class TestAnImageDescriptionIsCleanedNotDropped:
+    """lxml refuses a control character in an attribute, all or nothing.
+
+    So an unsanitized description used to be lost whole and in silence: the
+    picture was in the deck, its label was gone, and the preview could only ever
+    report ``null`` - which the UI draws as an unlabelled region. This is the
+    ``warnings`` case in this project's terms ("in the deck but adjusted ...
+    cleaned text"), and the text path already handles exactly these characters.
+    """
+
+    def _descr(self, description, capsys) -> tuple[str | None, str]:
+        prs, slide = _blank_deck()
+        picture = add_picture(
+            slide,
+            ImageElement(type="image", bbox=[100, 100, 300, 300], description=description),
+            _flat_source(),
+        )
+        return picture._element._nvXxPr.cNvPr.get("descr"), capsys.readouterr().err
+
+    def test_a_plain_description_is_written_and_silent(self, capsys):
+        descr, err = self._descr("team photo", capsys)
+        assert descr == "team photo"
+        assert err == ""
+
+    def test_korean_is_written_unchanged(self, capsys):
+        descr, err = self._descr("팀 사진", capsys)
+        assert descr == "팀 사진"
+        assert err == ""
+
+    @pytest.mark.parametrize("raw", ["team \x01photo", "team \x00photo"])
+    def test_a_control_character_is_removed_and_reported(self, raw, capsys):
+        descr, err = self._descr(raw, capsys)
+        assert descr == "team photo", "the label must survive, cleaned"
+        assert "had to be cleaned" in err, err
+        assert "WAS rendered" in err, "a picture that IS in the deck may not read as skipped"
+
+    def test_a_lone_surrogate_is_replaced_and_reported(self, capsys):
+        descr, err = self._descr("team \ud800photo", capsys)
+        assert descr == f"team {pptx_builder.UNENCODABLE_REPLACEMENT}photo"
+        assert "surrogate" in err, err
+        assert "WAS rendered" in err
+
+    def test_a_description_that_cleans_away_entirely_is_reported(self, capsys):
+        descr, err = self._descr("\x01\x02", capsys)
+        # Nothing storable was left, so the attribute keeps python-pptx's own
+        # default - which ``services.preview._picture_description`` discards
+        # rather than reporting it as the analyzer's description.
+        assert descr == "image.png", descr
+        assert "without a description" in err, err
+
+    def test_the_deck_still_saves_with_a_cleaned_description(self, tmp_path, capsys):
+        spec = SlideSpec.model_validate(
+            {
+                "elements": [
+                    {"type": "text", "bbox": [0, 0, 300, 40], "content": "캡션"},
+                    {
+                        "type": "image",
+                        "bbox": [100, 100, 300, 300],
+                        "description": "차트 \x01 2024",
+                    },
+                ]
+            }
+        )
+        out = build_pptx(spec, tmp_path / "descr.pptx", _flat_source())
+        capsys.readouterr()
+        picture = _pictures(Presentation(str(out)).slides[0])[0]
+        assert picture._element._nvXxPr.cNvPr.get("descr") == "차트  2024"
+
+
+# ---------------------------------------------------------------------------
+# the warning text the UI prints verbatim
+# ---------------------------------------------------------------------------
+class TestTheImageSkipWarningReadsAsOneSentence:
+    """It is printed verbatim in the panel the user is asked to read."""
+
+    def test_no_double_period_when_the_reason_already_ends_in_one(self, capsys):
+        build_presentation(
+            SlideSpec.model_validate(TestImageWithoutASourceImage.SPEC)
+        )
+        err = capsys.readouterr().err
+        assert "was NOT rendered" in err
+        assert ".." not in err, err
+        assert "saved spec. A dashed placeholder" in err, err
+
+    @pytest.mark.parametrize(
+        ("detail", "expected"),
+        [
+            ("ends without one", "ends without one."),
+            ("ends with one.", "ends with one."),
+            ("a question?", "a question?"),
+            ("  trailing space  ", "trailing space."),
+            ("", ""),
+        ],
+    )
+    def test_the_joiner_adds_exactly_one_stop(self, detail, expected):
+        assert pptx_builder._sentence(detail) == expected

@@ -1411,6 +1411,37 @@ class TestPreviewEndpointWithoutASourceImage:
         assert placeholder["width_pct"] == pytest.approx(30.0, abs=0.01)
         assert placeholder["height_pct"] == pytest.approx(40.0, abs=0.01)
         assert placeholder["fill_color"] is None, "a placeholder is see-through"
+        # The DASH is the one cue that tells the marker apart from a box the
+        # analyzer asked for. Without it in the payload the preview drew a
+        # solid rectangle the deck does not contain.
+        assert placeholder["line_dash"] == "dashed", placeholder
+
+    def test_the_warning_about_an_unreadable_crop_does_not_vouch_for_the_deck(
+        self, client, monkeypatch
+    ):
+        """``_crop_data_uri`` cannot know the .pptx is fine - and the one case
+        that produces this warning (a picture whose image relationship is
+        missing) is a deck that is NOT fine. It may report the preview's
+        degradation, never the file's health."""
+        from app.services import preview as preview_module
+
+        class Unreadable:
+            """A picture whose bytes cannot be resolved, as python-pptx reports
+            one: ``shape.image`` raises ``KeyError`` for a missing rel."""
+
+            @property
+            def image(self):
+                raise KeyError("no relationship with key 'rId2'")
+
+        warned: list[str] = []
+        monkeypatch.setattr(preview_module, "_warn", warned.append)
+        assert preview_module._crop_data_uri(Unreadable()) is None
+        joined = "\n".join(warned)
+        assert "placeholder" in joined, joined
+        assert "unaffected" not in joined, (
+            "the preview must not promise the deck is sound - it cannot know, "
+            f"and in this exact case it is not: {joined}"
+        )
 
     def test_a_warning_names_the_missing_source_and_what_to_do(self, client):
         """Never a silent omission. The line has to say that the element was
@@ -1486,7 +1517,12 @@ class TestThePayloadIsSerializable:
             "fill_color",
             "line_color",
             "line_width_pt",
+            "line_dash",
         }
+        # The builder's skipped-image marker is a DASHED outline, so the dash
+        # has to survive into the payload or the preview draws a shape the deck
+        # does not contain.
+        assert by_kind["shape"]["line_dash"] in ("solid", "dashed")
         assert set(by_kind["text"]) == geometry | {"kind", "align", "paragraphs"}
         assert set(by_kind["table"]) == geometry | {
             "kind",

@@ -166,6 +166,15 @@ function AutoShapeNode({
   const hasLine = Boolean(shape.line_color);
   const stroke = shape.line_color ?? "none";
   const strokeWidth = hasLine ? Math.max(0, num(shape.line_width_pt, 1)) : 0;
+  // A dashed outline is how the builder marks the bbox of an `image` element it
+  // could not render, chosen so the gap does not read as slide content. Drawing
+  // it solid would show a plain box the .pptx does not contain - and would make
+  // the marker indistinguishable from a rectangle the analyzer asked for. Same
+  // pattern maths as the connector's, in line-width units.
+  const dashArray =
+    shape.line_dash === "dashed" && strokeWidth > 0
+      ? `${DASH_ON * strokeWidth} ${DASH_OFF * strokeWidth}`
+      : undefined;
 
   if (shape.autoshape === "oval") {
     return (
@@ -177,6 +186,7 @@ function AutoShapeNode({
         fill={fill}
         stroke={stroke}
         strokeWidth={strokeWidth}
+        strokeDasharray={dashArray}
       />
     );
   }
@@ -194,6 +204,7 @@ function AutoShapeNode({
       fill={fill}
       stroke={stroke}
       strokeWidth={strokeWidth}
+      strokeDasharray={dashArray}
     />
   );
 }
@@ -249,18 +260,20 @@ function ConnectorNode({
   // routing it as a path would leave a zero-length segment for `marker-end` to
   // orient to. Draw it as the straight run it is.
   if (connector.elbow && dx > 0 && dy > 0) {
-    // Two segments, per the preview contract. The deck's own `bentConnector3`
-    // routes in THREE - half the horizontal run, then the vertical, then the
-    // other half - so it both leaves and arrives horizontally, which two
-    // segments cannot both do. Putting the LONG leg last matches the arrival
-    // direction, and therefore the arrowhead's direction, in both layouts that
-    // actually occur: boxes side by side (long dx, arrives horizontally) and
-    // boxes stacked (long dy, where the preset's final horizontal leg is
-    // near-zero and it effectively arrives vertically too).
-    const d =
-      dx >= dy
-        ? `M ${x1} ${y1} L ${x1} ${y2} L ${x2} ${y2}`
-        : `M ${x1} ${y1} L ${x2} ${y1} L ${x2} ${y2}`;
+    // The deck's own route, not an approximation of it. `bentConnector3` draws
+    // THREE legs - half the horizontal run, the whole vertical run, then the
+    // other half - so it both LEAVES and ARRIVES horizontally, and both of its
+    // arrowheads are therefore horizontal, whichever way the line runs (checked
+    // in all four direction quadrants: the flipH/flipV the deck writes never
+    // reorder the legs). Drawing one bend instead left the first or the last
+    // segment vertical, which turned that end's `<marker>` 90 degrees away from
+    // what the .pptx shows.
+    //
+    // The bend sits at the midpoint because the builder never overrides the
+    // preset's `adj1` (the saved geometry is `<a:avLst/>`, empty), so the route
+    // is fully determined by the two endpoints the payload already carries.
+    const mx = (x1 + x2) / 2;
+    const d = `M ${x1} ${y1} L ${mx} ${y1} L ${mx} ${y2} L ${x2} ${y2}`;
     return (
       <path
         d={d}
@@ -810,8 +823,8 @@ export default function SlidePreview({ preview, note = null }: SlidePreviewProps
       </p>
       {hasElbow ? (
         <p className="mt-1 text-xs leading-relaxed text-slate-500 [word-break:keep-all]">
-          꺾인 연결선은 실제 경로를 두 구간으로 근사해 그립니다. 이어지는 두 점과 화살표가 붙는
-          쪽은 PPTX와 같습니다.
+          꺾인 연결선은 PPTX와 같은 세 구간 경로(가로·세로·가로)로 그리며, 꺾이는 지점은 두 점의
+          가운데입니다. 화살표가 붙는 쪽과 그 방향도 PPTX와 같습니다.
         </p>
       ) : null}
       {note ? <p className="mt-1 text-xs text-amber-300">{note}</p> : null}

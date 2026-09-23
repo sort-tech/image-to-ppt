@@ -28,6 +28,7 @@ import copy
 import io
 import json
 import pathlib
+import re
 import time
 import urllib.parse
 import uuid
@@ -147,16 +148,56 @@ def assert_native_deck(data: bytes) -> Presentation:
     report = pptx_builder.flattening_report(presentation)
     assert report["flattened"] is False, report
     assert report["violations"] == [], report
+    # A picture whose bytes cannot be resolved is a deck PowerPoint offers to
+    # repair, and every OTHER number here reads normally on one - shape counts,
+    # geometry, even ``len(media) <= picture_count`` (media is 0). Without this
+    # line the helper blessed a corrupt file.
+    assert report["unreadable_picture_count"] == 0, report
 
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         names = archive.namelist()
     media = [name for name in names if name.startswith("ppt/media/")]
     # Media is allowed now, but ONLY as much of it as there are pictures: a
     # deck carrying image parts that no shape references would mean the crop
-    # went into the package without reaching the slide.
+    # went into the package without reaching the slide. Identical crops share
+    # ONE part, hence "<=" and not "==".
     assert len(media) <= report["picture_count"]
+    if report["picture_count"]:
+        assert media, "a picture is on the slide but its bytes are not in the package"
+    assert _every_embed_resolves(data)
     assert any(name.startswith("ppt/slides/slide") for name in names)
     return presentation
+
+
+def _every_embed_resolves(data: bytes) -> bool:
+    """Does every ``r:embed`` in every slide have a matching relationship?
+
+    A dangling one is an OPC violation - the "found a problem with content"
+    repair prompt - and it is invisible to python-pptx's own reader, so it has
+    to be checked against the raw package.
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        slides = [
+            name
+            for name in archive.namelist()
+            if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+        ]
+        for name in slides:
+            xml = archive.read(name).decode("utf-8")
+            rels_name = name.replace("slides/", "slides/_rels/") + ".rels"
+            rels = (
+                archive.read(rels_name).decode("utf-8")
+                if rels_name in archive.namelist()
+                else ""
+            )
+            declared = set(re.findall(r'Id="([^"]+)"', rels))
+            dangling = [
+                rid
+                for rid in re.findall(r'r:embed="([^"]+)"', xml)
+                if rid not in declared
+            ]
+            assert dangling == [], f"{name} references {dangling} with no relationship"
+    return True
 
 
 def spec_dict() -> dict:
@@ -715,6 +756,20 @@ IMAGE_RGB = (220, 40, 40)
 UPLOAD_PX = (1000, 700)
 
 
+def flat_png(size: tuple[int, int] = (1200, 800)) -> bytes:
+    """A uniform upload - a white document scan, a solid-colour deck.
+
+    Two equal-sized crops of it are BYTE-IDENTICAL, which is what makes
+    python-pptx de-duplicate them onto one image part with one shared
+    relationship id. No duplicate elements in the spec are needed.
+    """
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", size, (252, 252, 250)).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
 def diagram_png() -> bytes:
     """A PNG whose :data:`IMAGE_REGION` is solid :data:`IMAGE_RGB`, else white."""
     from PIL import Image
@@ -811,6 +866,60 @@ class TestConvertDrawsConnectorsAndCropsSubImages:
         assert report["flattened"] is False
         # 30% x 40% of the slide, well inside the area limit.
         assert report["slides"][0]["picture_area_pct"] == pytest.approx(12.0, abs=0.5)
+
+    def test_a_rejected_duplicate_crop_does_not_corrupt_the_served_deck(
+        self, client, monkeypatch, with_key, no_client_allowed
+    ):
+        """The file the user downloads has to open, not offer to repair.
+
+        Two equal-sized regions of a flat area crop to byte-identical PNGs, and
+        python-pptx gives both pictures the SAME image relationship. Their union
+        covers 90% of the slide, so the anti-flattening pass drops one - and
+        that drop used to delete the relationship the SURVIVOR still pointed at,
+        leaving a dangling ``r:embed`` and no ``ppt/media`` part at all. The
+        response was still a 200 and the warnings still said the .pptx was fine.
+        """
+        spec = {
+            "elements": [
+                {"type": "text", "bbox": [0, 0, 400, 60], "content": "구성도"},
+                {"type": "image", "bbox": [0, 50, 500, 900], "description": "왼쪽"},
+                {"type": "image", "bbox": [500, 50, 500, 900], "description": "오른쪽"},
+            ]
+        }
+        monkeypatch.setattr(
+            vision_analyzer,
+            "analyze_image",
+            fake_analyzer(SlideSpec.model_validate(spec)),
+        )
+        response = client.post("/api/convert", files=upload(flat_png(), "scan.png"))
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+        skips = [line for line in body["warnings"] if "NOT rendered" in line]
+        assert len(skips) == 1, body["warnings"]
+        # The figure quoted is the UNION of the two crops, which is what the
+        # slide really would have carried.
+        assert "90% of the slide" in skips[0], skips[0]
+        # Nothing may claim the file is unaffected - this is the case where the
+        # file was the broken part.
+        assert not any("unaffected" in line for line in body["warnings"]), body[
+            "warnings"
+        ]
+
+        deck = client.get(f"/api/download/{body['download_id']}")
+        assert deck.status_code == 200
+        presentation = assert_native_deck(deck.content)
+        pictures = [
+            shape
+            for shape in presentation.slides[0].shapes
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+        ]
+        assert len(pictures) == 1
+        assert pictures[0].image.blob, "the surviving crop's bytes are gone"
+
+        with zipfile.ZipFile(io.BytesIO(deck.content)) as archive:
+            media = [n for n in archive.namelist() if n.startswith("ppt/media/")]
+        assert len(media) == 1, media
 
     def test_the_preview_reports_both_new_kinds_in_z_order(self, body):
         kinds = [shape["kind"] for shape in body["preview"]["shapes"]]

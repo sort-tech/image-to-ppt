@@ -21,6 +21,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from app import config
 import cli
 from app import mock_data
+from app import pptx_builder
 from app import vision_analyzer
 from make_sample_image import make_sample_image
 from app.schemas import (
@@ -1178,3 +1179,57 @@ class TestTheReadmesKeylessRecipesReallyAreKeyless:
         )
         # ...and the honest half of the old example is NOT flagged.
         assert all("--save-json" in c or "-o /tmp/demo.pptx &&" in c for c in flagged)
+
+
+@readme_exists
+class TestTheReadmeStatesTheAntiFlatteningRuleThatIsActuallyInForce:
+    """The README is the only user-facing document, so a stale rule in it is a
+    false claim shown to a user - the same house rule that governs warnings.
+
+    "zero picture shapes and no ``ppt/media`` parts" was true until an ``image``
+    element became a legitimate way to carry a photo or a rendered chart. It
+    survived in two places after the code had moved on to
+    ``pptx_builder.flattening_report``, promising the opposite of what the suite
+    now asserts. This scan fails if that phrasing - or a promise that the input
+    image is never embedded - comes back.
+    """
+
+    #: Claims that were true before ``image`` elements existed and are false now.
+    SUPERSEDED = (
+        "zero picture shapes",
+        "no `ppt/media` parts",
+        "no `ppt/media/` parts",
+        "The input image is never embedded",
+    )
+
+    def test_no_superseded_flattening_claim_is_left_in_the_readme(self):
+        text = README.read_text(encoding="utf-8")
+        offenders = [phrase for phrase in self.SUPERSEDED if phrase in text]
+        assert offenders == [], (
+            "the README still states the abandoned guarantee; the rule in force "
+            "is pptx_builder.flattening_report(): "
+            f"{offenders}"
+        )
+
+    def test_the_readme_states_the_rule_that_is_in_force(self):
+        text = README.read_text(encoding="utf-8")
+        assert "flattening_report" in text, "the real rule is not named anywhere"
+        # The three rules, by their numbers, so a reader can check a deck.
+        assert f"{int(pptx_builder.FULL_BLEED_PICTURE_PCT)}%" in text
+        assert f"{int(pptx_builder.MAX_PICTURE_AREA_PCT)}%" in text
+
+    def test_the_readme_documents_the_element_types_the_builder_can_emit(self):
+        text = README.read_text(encoding="utf-8")
+        for token in ("connector", "start_point", "end_point", '"type": "image"'):
+            assert token in text, f"the README never mentions {token!r}"
+
+    def test_the_guard_can_actually_fail(self):
+        """A guard nobody has seen fail is a guard nobody knows works."""
+        stale = (
+            "so the test suite asserts that every saved deck has zero picture "
+            "shapes and no `ppt/media` parts."
+        )
+        assert [p for p in self.SUPERSEDED if p in stale] == [
+            "zero picture shapes",
+            "no `ppt/media` parts",
+        ]

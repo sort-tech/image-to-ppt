@@ -4,12 +4,28 @@ Turn a picture of a slide into a **real PowerPoint slide** - in the browser, or
 from the command line.
 
 Feed it a screenshot, a scanned page, a whiteboard photo or a diagram, and it
-writes a `.pptx` whose shapes, tables and text boxes are **native, editable
-PowerPoint objects**: you can click the table and retype a cell, drag a box,
-restyle the header. The input image is never embedded. If the output contained
-a flattened picture the whole exercise would be pointless, so the test suite
-asserts that every saved deck has **zero picture shapes and no `ppt/media`
-parts**.
+writes a `.pptx` whose shapes, connectors, tables and text boxes are **native,
+editable PowerPoint objects**: you can click the table and retype a cell, drag
+a box, restyle the header, re-point an arrow.
+
+The one exception is an **`image` element**: a region the analyzer genuinely
+cannot express as shape, table or text - a photo, a rendered chart, a logo -
+is cropped out of the source image and embedded as a picture. That exception is
+fenced, because pasting the input onto a slide would make the whole exercise
+pointless. `pptx_builder.flattening_report()` is the single definition of
+"flattened" that the build, the API and the suite all read, and it fails a deck
+when any of three rules breaks:
+
+1. **no single picture covers the slide** - not `>= 95%` of the slide width
+   *and* `>= 95%` of its height;
+2. **all pictures together cover at most 80% of the slide** (the union of their
+   boxes, so overlap counts once) - four 50%x50% pictures pass rule 1 while
+   tiling exactly the screenshot rule 1 forbids;
+3. **a picture-only slide is a flattened slide** - a slide carrying a picture
+   must also carry at least one native shape, connector, table or text box.
+
+When the analyzer's own output would break a rule, the offending `image`
+element is skipped with a warning naming it; a flattened deck is never written.
 
 ```
   browser (React) ──┐
@@ -61,7 +77,7 @@ image-to-ppt/
 │   │   ├── config.py           endpoint, model, slide geometry, styling defaults
 │   │   ├── schemas.py          the pydantic contract + tolerant validation
 │   │   ├── vision_analyzer.py  prompt, request, JSON recovery
-│   │   ├── pptx_builder.py     SlideSpec ➜ .pptx (native shapes only)
+│   │   ├── pptx_builder.py     SlideSpec ➜ .pptx (native objects + fenced crops)
 │   │   ├── mock_data.py        a hand-built sample spec - a TEST FIXTURE only,
 │   │   │                       not a product feature (Mock mode is gone)
 │   │   ├── main.py             the FastAPI app: CORS, router, one error envelope
@@ -597,7 +613,16 @@ The response is the `POST /api/convert` response **without** `download_id` and
     "shapes": [
       { "kind": "shape", "autoshape": "rectangle",
         "left_pct": 0.0, "top_pct": 0.0, "width_pct": 100.0, "height_pct": 15.6,
-        "fill_color": "#1D356A", "line_color": null, "line_width_pt": null },
+        "fill_color": "#1D356A", "line_color": null, "line_width_pt": null,
+        "line_dash": "solid" },
+      { "kind": "connector",
+        "start_pct": { "x": 12.5, "y": 30.0 },
+        "end_pct": { "x": 48.0, "y": 30.0 },
+        "elbow": false, "arrow_start": false, "arrow_end": true,
+        "dash": "solid", "color": "#1E3A6E", "width_pt": 1.5 },
+      { "kind": "image",
+        "left_pct": 60.0, "top_pct": 20.0, "width_pct": 30.0, "height_pct": 40.0,
+        "data_uri": "data:image/png;base64,...", "description": "team photo" },
       { "kind": "text",
         "left_pct": 2.8, "top_pct": 5.0, "width_pct": 38.0, "height_pct": 5.0,
         "align": "left",
@@ -632,9 +657,19 @@ Rules the payload keeps:
 - `font_size_pt` falls back to the builder's own default
   (`DEFAULT_TEXT_FONT_SIZE` 12pt / `DEFAULT_TABLE_FONT_SIZE` 10pt) when a run
   carries no explicit size, so the UI never has to guess.
-- a shape python-pptx reports as a **picture** would come back as
-  `{"kind": "unsupported"}` rather than crashing. The builder emits none, ever -
-  `X-Element-Counts` and the suite both pin that.
+- a **connector** carries `start_pct`/`end_pct` and **no** `left_pct`/`width_pct`
+  box, because it has no `bbox` in the spec either; a box would also lose which
+  end the arrowhead is on. `dash`, `arrow_start`, `arrow_end`, `color` and
+  `width_pt` are read back off the deck's `a:ln`, and `elbow` says the deck used
+  `bentConnector3`.
+- an **`image`**'s `data_uri` is the crop **that is really embedded in the
+  deck** (`shape.image.blob`), never the source image: downscaled to a longest
+  side of 480px and capped at 96KB, and `null` (with a `warnings` line) when it
+  cannot be read or will not fit. A `null` is drawn as a labelled placeholder,
+  not as an empty box.
+- a shape kind the payload has no reader for comes back as
+  `{"kind": "unsupported"}` rather than crashing. Pictures and connectors are
+  **not** in that bucket any more - they have their own entries above.
 
 ```bash
 curl -s -H 'Content-Type: application/json' \
@@ -838,21 +873,58 @@ via `POST /api/build-from-json` or `--from-json`.
       ],
       "header_bg_color": "#1F3B73",
       "header_font_bold": true,
-      "font_size": 10 }
+      "font_size": 10 },
+
+    { "type": "connector",              // NO bbox: two points instead
+      "kind": "elbow",                  // straight (default) | elbow
+      "start_point": { "x": 120, "y": 360 },
+      "end_point": [420, 520],          // [x, y] is accepted too
+      "arrow_start": false,             // default false
+      "arrow_end": true,                // default true
+      "dash_style": "dashed",           // solid (default) | dashed
+      "color": "#1F3B73",
+      "width_pt": 1.5 },
+
+    { "type": "image",                  // a region CROPPED from the input image
+      "bbox": [600, 200, 300, 400],
+      "description": "team photo" }     // -> the picture's alt text
   ]
 }
 ```
 
 Element types and fields:
 
-- **`shape`** - `kind` is `rectangle` (default), `rounded_rectangle` or
-  `circle`; `fill_color`, `border_color`, `border_width`. A shape with no
+- **`shape`** - `kind` is `rectangle` (default), `rounded_rectangle`, `circle`
+  or one of the block arrows `arrow_right` / `arrow_left` / `arrow_up` /
+  `arrow_down`; `fill_color`, `border_color`, `border_width`. A shape with no
   `fill_color` is drawn *unfilled*, so it can frame content painted later.
   Shapes never carry text.
 - **`table`** - `data` is a 2-D array of strings; ragged rows are padded with
   `""`; `header_bg_color`, `header_font_bold`, `font_size`.
 - **`text`** - `content` (**required**, with `\n` for line breaks),
   `font_size`, `font_color`, `bold`, `align`.
+- **`connector`** - a diagram connector, the one element type with **no
+  `bbox`**: it is defined by `start_point` and `end_point` (each a
+  `{"x":…,"y":…}` dict or an `[x, y]` pair, on the same 0..1000 grid, clamped
+  the same way). `kind` is `straight` (default) or `elbow`; `arrow_start`
+  (default `false`) and `arrow_end` (default `true`) say which end carries the
+  arrowhead; `dash_style` is `solid` (default) or `dashed`; `color` and
+  `width_pt` follow the usual colour/size rules. A missing or unreadable
+  `x`/`y` invalidates the element exactly as a broken `bbox` does -
+  `connector 3: start_point - 'y' is missing or unreadable`.
+- **`image`** - a region cropped out of the **source image** and embedded as a
+  picture: `bbox` plus an optional `description` (written into the picture's alt
+  text, and read back from there by the preview). This is the flattening
+  exception fenced by the three rules at the top of this file, and it is meant
+  for a photo, a rendered chart, a logo or a complex illustration - not for
+  ordinary boxes, text or tables, and never for one big region covering the
+  slide. Only a conversion has the source image: `POST /api/preview`,
+  `POST /api/build-from-json` and `cli.py --from-json` have nothing to crop
+  from, so they skip the element, warn that the conversion has to be re-run, and
+  draw a dashed grey placeholder outline at the bbox so the gap is visible in
+  the deck. An EXIF-rotated source (an ordinary portrait phone photo) is
+  normalized to its **displayed** orientation before the crop, which is the
+  frame the bbox is measured in.
 
 Robustness rules baked into the schema: colours accept `#FFF`, `fff`,
 `FFFFFF`, `#ffffff` and `#RRGGBBAA` (alpha dropped) and fall back to `None` if
@@ -1001,9 +1073,13 @@ Coverage highlights:
   the `response_format`-rejected retry.
 - `tests/test_pptx_builder.py` - slide geometry, per-element shape mapping,
   z-order preservation, table sizing and fonts, textbox wrapping and
-  alignment, graceful degradation of bad colours, one broken element not
-  aborting the build, and **the reopened deck containing no picture shapes and
-  no `ppt/media/` parts**.
+  alignment, connector endpoints / arrowheads (written as raw `a:headEnd` /
+  `a:tailEnd`, since python-pptx has no arrowhead API) / dash styles, cropping
+  an `image` element out of the source, graceful degradation of bad colours, one
+  broken element not aborting the build, and **the reopened deck passing
+  `pptx_builder.flattening_report()`** - the three anti-flattening rules quoted
+  at the top of this file, plus the check that every embedded picture's bytes
+  really resolve inside the package.
 - `tests/test_cli.py` - `--from-json`, `--save-json`, `--mock` being gone, flag
   forwarding, exit codes (0/1/2), friendly errors without tracebacks, the
   Pillow sample-image generator, and a scan of **this README's own bash blocks**

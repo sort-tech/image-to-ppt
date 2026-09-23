@@ -334,6 +334,19 @@ def _warn(message: str) -> None:
     print(f"[pptx_builder] warning: {message}", file=sys.stderr)
 
 
+def _sentence(detail: str) -> str:
+    """*detail* with exactly one closing full stop, ready to be joined onto more.
+
+    Exception messages in this module end in a period about half the time, and a
+    blind ``f"{detail}."`` produced "...from a saved spec.." in the warning the UI
+    prints verbatim - in the very panel the user is being asked to read.
+    """
+    text = str(detail or "").strip()
+    if not text:
+        return ""
+    return text if text.endswith((".", "!", "?", ":", ";")) else f"{text}."
+
+
 def _fit_span(
     start_in: float, size_in: float, extent_in: float
 ) -> tuple[float, float, bool, bool]:
@@ -521,16 +534,48 @@ def _set_alt_text(shape, text: str | None) -> None:
     only ever report as ``null``. It is also the accessibility field PowerPoint
     itself shows, which is where a "team photo" label belongs anyway.
 
-    Best-effort, like every other cosmetic write here: a description is never
-    worth losing the picture over.
+    The value is CLEANED first, exactly as run text is. lxml refuses a control
+    character or a lone UTF-16 surrogate inside an attribute value, and the write
+    is all-or-nothing, so an unsanitized description used to be dropped whole and
+    in silence - the picture was in the deck, its label was gone, and the preview
+    could only ever report ``null``. That is the ``warnings`` case in this
+    project's own terms ("in the deck but adjusted ... cleaned text"), so the
+    cleaning is reported.
+
+    Best-effort in the sense that matters: a description is never worth losing the
+    picture over. It is NOT best-effort in the sense of staying quiet - a label
+    that could not be stored is said out loud.
     """
-    label = (text or "").strip()
-    if not label:
+    raw = (text or "").strip()
+    if not raw:
         return
+    label, replaced = _clean_text_counted(raw)
+    label = label.strip()
+    if not label:
+        _warn(
+            "an image element's description contained nothing a .pptx can store, so "
+            "the picture WAS rendered without a description."
+        )
+        return
+    if replaced:
+        _warn_replaced("an image element's description", replaced)
+    elif label != raw:
+        # Cleaning covers both removals (control characters) and normalization
+        # (CRLF -> LF), so the message names the outcome rather than guessing
+        # which of the two happened.
+        _warn(
+            "an image element's description had to be cleaned before it could be "
+            "stored in a .pptx (control characters removed, line breaks "
+            f"normalized). The picture WAS rendered, with the description {label!r}."
+        )
     try:
         shape._element._nvXxPr.cNvPr.set("descr", label)
-    except Exception:  # noqa: BLE001 - alt text may never break a build
-        pass
+    except Exception as exc:  # noqa: BLE001 - alt text may never break a build
+        _warn(
+            f"an image element's description could not be recorded as the picture's "
+            f"alt text ({type(exc).__name__}: {exc}); the picture WAS rendered, but "
+            "the preview can only report it without a description."
+        )
 
 
 def _set_table_style(table, style_id: str) -> None:
@@ -841,6 +886,30 @@ def add_connector(slide, el: ConnectorElement):
 # --------------------------------------------------------------------------- #
 
 
+def _apply_exif_orientation(image):
+    """Rotate *image* into the frame it is DISPLAYED in, per its EXIF Orientation.
+
+    This is a correctness fix, not a nicety. A bbox is measured in the frame the
+    analyzer and the user looked at: the frontend shows the upload in an ``<img>``
+    and every browser applies EXIF Orientation, and the vision provider decodes the
+    same bytes with orientation applied too. Pillow does NOT - ``Image.open`` hands
+    back the STORED grid. For the ordinary portrait-phone photo (Orientation=6) the
+    two grids are transposed, so "the top-left region" named a completely different
+    part of the picture and the deck embedded the wrong crop, silently.
+
+    ``exif_transpose`` is a no-op for an image with no orientation tag (and it
+    clears the tag, so applying it twice is harmless). A failure here degrades to
+    the untransposed image rather than costing the element - the house rule is to
+    degrade where degrading is possible.
+    """
+    try:
+        from PIL import ImageOps
+
+        return ImageOps.exif_transpose(image) or image
+    except Exception:  # noqa: BLE001 - an unreadable EXIF block may not cost the crop
+        return image
+
+
 def _decode_source_image(source: SourceImage):
     """Decode *source* into a PIL image, or raise :class:`PictureSourceError`.
 
@@ -860,6 +929,9 @@ def _decode_source_image(source: SourceImage):
 
     # An already-decoded PIL image: used as-is (decoded once per build, not per
     # element). Duck-typed so nothing here needs Pillow imported at module scope.
+    # It is taken in the frame the CALLER decoded it in - orientation is applied
+    # where the bytes are decoded (see _apply_exif_orientation), and re-deriving it
+    # from an object that may not even be a PIL image is not this branch's job.
     if hasattr(source, "crop") and hasattr(source, "size"):
         return source
 
@@ -886,7 +958,7 @@ def _decode_source_image(source: SourceImage):
         # truncated file fails here rather than half way through the save.
         image = Image.open(io.BytesIO(data))
         image.load()
-        return image
+        return _apply_exif_orientation(image)
     except PictureSourceError:  # pragma: no cover - defensive
         raise
     except Exception as exc:  # noqa: BLE001 - every decode failure is the same failure
@@ -1087,6 +1159,73 @@ def _shape_area(shape) -> int:
     return width * height
 
 
+def _shape_rect(shape, clip_w: int, clip_h: int) -> tuple[int, int, int, int] | None:
+    """A shape's on-slide box, clipped to the slide; ``None`` when it has no area."""
+    try:
+        left = int(shape.left or 0)
+        top = int(shape.top or 0)
+        right = left + max(int(shape.width or 0), 0)
+        bottom = top + max(int(shape.height or 0), 0)
+    except Exception:  # noqa: BLE001 - defensive: an unmeasurable shape
+        return None
+    left = max(left, 0)
+    top = max(top, 0)
+    right = min(right, clip_w)
+    bottom = min(bottom, clip_h)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _union_area(rects: list[tuple[int, int, int, int]]) -> int:
+    """The area of the UNION of *rects* (EMU^2), counting overlap once.
+
+    Summing the rectangles instead would double-count it, and that is not a
+    rounding detail: two copies of the same 45%-of-slide region - the classic
+    vision-model repetition - summed to 90% and tripped the area rule over a slide
+    that is 45% covered, dropping a picture that should have been kept while the
+    warning quoted a coverage the deck never had. Three stacked crops reported
+    135%, a percentage that cannot exist.
+
+    A sweep over the x edges: within one vertical slab the set of rectangles is
+    constant, so the union is (merged y length) * (slab width). Exact, and a
+    handful of pictures is all this ever sees.
+    """
+    if not rects:
+        return 0
+    edges = sorted({edge for left, _, right, _ in rects for edge in (left, right)})
+    total = 0
+    for x0, x1 in zip(edges, edges[1:]):
+        if x1 <= x0:  # pragma: no cover - a sorted set cannot produce this
+            continue
+        spans = sorted(
+            (top, bottom) for left, top, right, bottom in rects if left <= x0 < right
+        )
+        covered = 0
+        run_top, run_bottom = None, None
+        for top, bottom in spans:
+            if run_bottom is None or top > run_bottom:
+                if run_bottom is not None:
+                    covered += run_bottom - run_top
+                run_top, run_bottom = top, bottom
+            elif bottom > run_bottom:
+                run_bottom = bottom
+        if run_bottom is not None:
+            covered += run_bottom - run_top
+        total += covered * (x1 - x0)
+    return total
+
+
+def _picture_area(pictures: list, slide_w: int, slide_h: int) -> int:
+    """How much of the slide the pictures together really cover (EMU^2)."""
+    rects = [
+        rect
+        for rect in (_shape_rect(shape, slide_w, slide_h) for shape in pictures)
+        if rect is not None
+    ]
+    return _union_area(rects)
+
+
 def _pct_of(part: float, whole: float) -> float:
     """``part`` as a percentage of ``whole``, rounded; 0.0 when whole is unusable."""
     try:
@@ -1122,6 +1261,21 @@ def _exceeds_picture_area(total_area: float, slide_area: float) -> bool:
     return _pct_of(total_area, slide_area) > MAX_PICTURE_AREA_PCT + _PCT_EPS
 
 
+def _picture_bytes_resolve(shape) -> bool:
+    """True when the picture's image bytes can actually be found in the package.
+
+    A ``<a:blip r:embed="rIdN">`` whose relationship is missing is an OPC violation
+    - PowerPoint answers it with its "found a problem with content" repair prompt,
+    and python-pptx raises ``KeyError`` on ``shape.image``. It is worth a check
+    because a deck like that is indistinguishable from a healthy one by shape
+    count, size or geometry: every other number in this report reads normally.
+    """
+    try:
+        return bool(shape.image.blob)
+    except Exception:  # noqa: BLE001 - any failure to resolve is the failure
+        return False
+
+
 def flattening_report(presentation) -> dict:
     """Is this deck a real editable slide, or a flattened image of one?
 
@@ -1138,11 +1292,20 @@ def flattening_report(presentation) -> dict:
     2. **All pictures together cover at most** :data:`MAX_PICTURE_AREA_PCT` **of the
        slide.** Rule 1 alone has a hole: four pictures of 50%x50% each pass a 95%
        per-picture check while tiling the slide into exactly the flattened
-       screenshot rule 1 forbids. Area closes it.
+       screenshot rule 1 forbids. Area closes it. The figure is the UNION of the
+       picture boxes, clipped to the slide, so overlapping or duplicated crops are
+       counted once and ``picture_area_pct`` really is the share of the slide the
+       pictures cover (see :func:`_union_area`).
     3. **A picture-only slide is a flattened slide.** If a slide carries any
        picture it must ALSO carry at least one native object (auto shape,
        connector, table or text box). A deck whose only content is pictures is not
        an editable deck, whatever the individual sizes say.
+
+    ``unreadable_picture_count`` is not one of the three rules and does not set
+    ``flattened``: it counts pictures whose image bytes cannot be resolved out of
+    the package, i.e. a deck PowerPoint would offer to repair. It is reported here
+    because this is the seam every caller already trusts for "is the deck we are
+    about to ship sound", and a corrupt picture must not pass that check unseen.
 
     Returns a dict::
 
@@ -1150,8 +1313,10 @@ def flattening_report(presentation) -> dict:
          "violations": [str, ...],     # one human-readable line per violation
          "slide_count": int,
          "picture_count": int,
+         "unreadable_picture_count": int,
          "slides": [{"index": int, "picture_count": int, "native_count": int,
                      "picture_area_pct": float, "full_bleed_count": int,
+                     "unreadable_picture_count": int,
                      "flattened": bool, "violations": [str, ...]}, ...]}
 
     A deck with no pictures at all is trivially not flattened.
@@ -1163,14 +1328,17 @@ def flattening_report(presentation) -> dict:
     slides: list[dict] = []
     violations: list[str] = []
     picture_total = 0
+    unreadable_total = 0
 
     for index, slide in enumerate(presentation.slides):
         shapes = list(slide.shapes)
         pictures = [shape for shape in shapes if _is_picture(shape)]
         natives = [shape for shape in shapes if not _is_picture(shape)]
         picture_total += len(pictures)
+        unreadable = [shape for shape in pictures if not _picture_bytes_resolve(shape)]
+        unreadable_total += len(unreadable)
 
-        area = sum(_shape_area(shape) for shape in pictures)
+        area = _picture_area(pictures, slide_w, slide_h)
         area_pct = _pct_of(area, slide_area)
         full_bleed = [
             shape for shape in pictures if _is_full_bleed(shape, slide_w, slide_h)
@@ -1202,6 +1370,7 @@ def flattening_report(presentation) -> dict:
                 "native_count": len(natives),
                 "picture_area_pct": area_pct,
                 "full_bleed_count": len(full_bleed),
+                "unreadable_picture_count": len(unreadable),
                 "flattened": bool(own),
                 "violations": own,
             }
@@ -1213,26 +1382,84 @@ def flattening_report(presentation) -> dict:
         "violations": violations,
         "slide_count": len(slides),
         "picture_count": picture_total,
+        "unreadable_picture_count": unreadable_total,
         "slides": slides,
     }
+
+
+#: Every attribute a slide part can point at a relationship with. ``r:id`` is the
+#: generic one, ``r:embed`` is what a picture's ``<a:blip>`` uses and ``r:link`` is
+#: the linked-picture spelling. All three are counted before a relationship is
+#: released - see :func:`_release_image_rel`.
+_REL_REF_ATTRS = ("//@r:id", "//@r:embed", "//@r:link")
+
+
+def _rel_is_still_referenced(part, rel_id: str) -> bool | None:
+    """Does anything in *part*'s XML still point at ``rel_id``?
+
+    ``None`` means "could not be determined", which callers treat as "yes": an
+    unused image part costs a few kilobytes, while a dropped relationship that was
+    still in use costs the whole file.
+    """
+    try:
+        element = part._element
+        for xpath in _REL_REF_ATTRS:
+            if rel_id in set(element.xpath(xpath)):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - pragma: no cover - defensive
+        return None
+
+
+def _release_image_rel(part, rel_id: str) -> None:
+    """Drop a removed picture's image relationship - only if nothing else uses it.
+
+    Deliberately NOT ``part.drop_rel()``. python-pptx 1.0.2 gates that on
+    ``_rel_ref_count``, which counts ``//@r:id`` only; a picture points at its image
+    part through ``r:embed``, so the count is 0 for an image relationship however
+    many ``<p:pic>`` elements still reference it, and the relationship is popped
+    unconditionally. That is fatal for identical crops: python-pptx de-duplicates
+    image parts by SHA-1 and ``relate_to`` hands the SAME rId to both pictures, so
+    dropping one of two byte-identical crops used to delete the relationship the
+    SURVIVOR still points at. The result was a dangling ``r:embed`` and no
+    ``ppt/media`` part at all - the OPC violation PowerPoint offers to "repair",
+    shipped with a 200 and a warning claiming the .pptx was fine.
+
+    Dropping the relationship is still worth doing when it IS unused: python-pptx
+    serializes the parts it can reach through the relationship graph, so a kept
+    relationship means the rejected crop's bytes travel in the package unused.
+    """
+    if _rel_is_still_referenced(part, rel_id) is not False:
+        return  # still in use, or not provably unused: keep the bytes, keep the file
+    try:
+        part.rels.pop(rel_id)
+    except Exception:  # noqa: BLE001 - pragma: no cover - an orphan part only
+        _warn(
+            "a rejected picture's image relationship could not be released; the deck "
+            "may carry that crop's bytes as an unused part. The slide itself is "
+            "correct - nothing references them."
+        )
 
 
 def _remove_shape(shape) -> bool:
     """Take *shape* off its slide again; True when it is really gone.
 
-    For a picture the image RELATIONSHIP is dropped as well, and that is not a
+    For a picture the image RELATIONSHIP is released as well, and that is not a
     detail: removing only the ``<p:pic>`` element leaves the image part behind in
     the package (measured - ``ppt/media/image1.png`` was still written), so a deck
     that refuses to show a flattened image would still be shipping its bytes.
-    python-pptx serializes the parts it can reach through the relationship graph,
-    so dropping the relationship drops the part with it.
+
+    The slide part is captured BEFORE the element is detached: ``shape.part`` walks
+    up the XML tree, so afterwards there is no handle on it any more.
     """
     rel_id = None
+    part = None
     if _is_picture(shape):
         try:
             rel_id = getattr(shape._element, "blip_rId", None)
+            part = shape.part
         except Exception:  # noqa: BLE001 - pragma: no cover - defensive
-            rel_id = None
+            rel_id, part = None, None
     try:
         element = shape._element
         parent = element.getparent()
@@ -1241,15 +1468,8 @@ def _remove_shape(shape) -> bool:
         parent.remove(element)
     except Exception:  # noqa: BLE001 - pragma: no cover - defensive
         return False
-    if rel_id:
-        try:
-            # Called AFTER the element is gone, so the reference count is 0.
-            shape.part.drop_rel(rel_id)
-        except Exception:  # noqa: BLE001 - pragma: no cover - an orphan part only
-            _warn(
-                "a rejected picture's image part could not be dropped from the "
-                "package; the deck still carries its bytes, unused."
-            )
+    if rel_id and part is not None:
+        _release_image_rel(part, rel_id)
     return True
 
 
@@ -1301,9 +1521,13 @@ def _enforce_not_flattened(prs, slide, pictures: list[tuple[int, Any]]) -> None:
                 "tables instead.",
             )
 
-    # Rule 2: pictures tiling the slide. Largest first, until the total fits.
+    # Rule 2: pictures tiling the slide. Largest first, until the covered area
+    # fits. The figure is the UNION of the boxes (:func:`_picture_area`), the same
+    # one the report publishes: summing them instead double-counted overlap, so two
+    # copies of one 45% region read as 90% and a picture was dropped - with a
+    # warning quoting a coverage the slide never had - over a slide 45% covered.
     while kept:
-        total = sum(_shape_area(shape) for _, shape in kept)
+        total = _picture_area([shape for _, shape in kept], slide_w, slide_h)
         if not _exceeds_picture_area(total, slide_area):
             break
         entry = max(kept, key=lambda item: _shape_area(item[1]))
@@ -1461,7 +1685,10 @@ def build_presentation(
                     if marked
                     else ""
                 )
-                _warn(f"element #{index} (image) was NOT rendered: {detail}.{tail}")
+                _warn(
+                    f"element #{index} (image) was NOT rendered: "
+                    f"{_sentence(detail)}{tail}"
+                )
             else:
                 _warn(f"skipped element #{index} ({kind}): {detail}")
         else:

@@ -534,17 +534,25 @@ def _crop_data_uri(shape: Any) -> str | None:
         content_type = str(image.content_type or "") or "application/octet-stream"
         pixels = tuple(int(value) for value in (image.size or (0, 0)))
     except Exception as exc:  # noqa: BLE001
+        # NOT "the .pptx itself is unaffected": this reader cannot know that, and
+        # when it used to say so it was saying it about the one case that proves
+        # otherwise - a picture whose image relationship is missing from the
+        # package reads back as exactly this KeyError, and THAT deck is the broken
+        # thing. Report what is known and point at the deck instead of vouching
+        # for it.
         _warn(
             f"an image element's embedded bytes could not be read back from the "
             f"deck ({type(exc).__name__}: {exc}); the preview shows a placeholder "
-            "instead of the crop. The .pptx itself is unaffected."
+            "instead of the crop. The picture in the .pptx may be unreadable too - "
+            "open the downloaded file to check it."
         )
         return None
 
     if not blob:
         _warn(
             "an image element carries no embedded bytes, so the preview shows a "
-            "placeholder instead of the crop. The .pptx itself is unaffected."
+            "placeholder instead of the crop - and the picture in the .pptx is "
+            "empty as well."
         )
         return None
 
@@ -731,7 +739,15 @@ def _table_payload(shape: Any, geometry: dict[str, float]) -> dict[str, Any]:
 
 
 def _shape_payload(shape: Any, geometry: dict[str, float]) -> dict[str, Any]:
-    """An auto shape: its preset, its fill and its outline."""
+    """An auto shape: its preset, its fill and its outline.
+
+    ``line_dash`` is reported for the same reason the connector reports it, and it
+    is not decoration: the builder's skipped-image marker is a DASHED grey
+    rectangle, chosen so the gap reads as a marker rather than as slide content. A
+    payload without the dash previewed it as a plain solid box - a shape the deck
+    does not contain - and the one cue that tells the two apart was lost on the way
+    out. Same helper as the connector's, so there is one definition of "dashed".
+    """
     line = getattr(shape, "line", None)
     return {
         "kind": "shape",
@@ -740,6 +756,7 @@ def _shape_payload(shape: Any, geometry: dict[str, float]) -> dict[str, Any]:
         "fill_color": _solid_fill(getattr(shape, "fill", None)),
         "line_color": _line_color(line),
         "line_width_pt": _line_width_pt(line),
+        "line_dash": _dash(line),
     }
 
 

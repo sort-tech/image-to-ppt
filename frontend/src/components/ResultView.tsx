@@ -14,7 +14,8 @@ import {
 } from "lucide-react";
 
 import SlidePreview from "./SlidePreview";
-import type { ConvertResponse, ElementType } from "../types/slide";
+import { renderedCounts } from "../types/slide";
+import type { ConvertResponse, ElementCounts, ElementType } from "../types/slide";
 
 interface ResultViewProps {
   result: ConvertResponse | null;
@@ -45,6 +46,30 @@ const BADGES: ReadonlyArray<{
   { key: "image", label: "이미지", icon: ImageIcon, tone: "text-indigo-300 border-indigo-500/30 bg-indigo-500/10" },
 ];
 
+/** The types a user can be told about, in the order the badges show them. */
+const BADGE_KEYS: ReadonlyArray<ElementType> = BADGES.map(({ key }) => key);
+
+/**
+ * The types whose requested count exceeds what the deck holds, with the gap.
+ *
+ * Only an `image` element can realistically land here (the builder skips it
+ * with no source image to crop from, or when the anti-flattening rule refuses
+ * the crop), but the comparison is made for every type rather than special-
+ * casing one: render isolation can skip anything, and a badge that overstates
+ * the file is the same defect whichever type it is.
+ */
+function skippedByType(
+  requested: ElementCounts,
+  rendered: ElementCounts,
+): Array<{ label: string; missing: number }> {
+  const gaps: Array<{ label: string; missing: number }> = [];
+  for (const { key, label } of BADGES) {
+    const missing = (requested[key] ?? 0) - (rendered[key] ?? 0);
+    if (missing > 0) gaps.push({ label, missing });
+  }
+  return gaps;
+}
+
 /**
  * The finished conversion: the rendered preview, the download button, element
  * tallies, and the two diagnostic panels.
@@ -53,8 +78,16 @@ const BADGES: ReadonlyArray<{
  * deciding to download it.
  *
  * `dropped` and `warnings` are kept visually distinct on purpose - a dropped
- * element means something is MISSING from the deck (amber), while a warning
- * means everything is there but something was adjusted (neutral).
+ * element means something is MISSING from the deck because it failed
+ * validation (amber), while a warning is a render-time adjustment or skip
+ * (neutral). Note that "warning" no longer implies "in the deck": an `image`
+ * element with nothing to crop from is reported here too, and the panel's copy
+ * has to cover both rather than promising everything is on the slide.
+ *
+ * The tallies are read off the PREVIEW, which is derived from the built deck -
+ * never from `counts`, which is what the spec asked for. The two differ exactly
+ * when the builder skipped something, and that is the moment a badge must not
+ * claim the file holds it.
  */
 export default function ResultView({
   result,
@@ -77,6 +110,16 @@ export default function ResultView({
   }
 
   const { counts, total, dropped, warnings, filename, preview } = result;
+
+  // What the deck really holds, read off the deck-derived preview. Null only
+  // when the preview could not be derived at all - and then the panel says
+  // whose numbers it is showing instead of quietly passing off the request.
+  const rendered = renderedCounts(preview);
+  const shown = rendered ?? counts;
+  const shownTotal = rendered
+    ? BADGE_KEYS.reduce((sum, key) => sum + (rendered[key] ?? 0), 0)
+    : total;
+  const skipped = rendered ? skippedByType(counts, rendered) : [];
 
   return (
     <div className="space-y-4 animate-fade-in">
@@ -109,11 +152,11 @@ export default function ResultView({
       <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
         <div className="mb-4 flex items-center gap-2">
           <Layers aria-hidden="true" className="h-4 w-4 text-sky-400" />
-          <h3 className="text-sm font-semibold text-slate-100">네이티브 요소</h3>
+          <h3 className="text-sm font-semibold text-slate-100">슬라이드 구성 요소</h3>
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <div className="rounded-xl border border-slate-700 bg-slate-950/60 px-4 py-3">
-            <p className="text-2xl font-semibold tabular-nums text-slate-50">{total}</p>
+            <p className="text-2xl font-semibold tabular-nums text-slate-50">{shownTotal}</p>
             <p className="text-xs text-slate-400">전체</p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -123,12 +166,30 @@ export default function ResultView({
                 className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium ${tone}`}
               >
                 <Icon aria-hidden="true" className="h-3.5 w-3.5" />
-                <span className="tabular-nums">{counts[key] ?? 0}</span>
+                <span className="tabular-nums">{shown[key] ?? 0}</span>
                 <span className="text-slate-400">{label}</span>
               </span>
             ))}
           </div>
         </div>
+        {/* The numbers above describe the FILE. When the spec asked for more
+            than the file holds, the gap is named here rather than folded into
+            a badge - otherwise a skipped image just looks like a smaller
+            number and the user has no way to tell it was ever requested. */}
+        {skipped.length > 0 ? (
+          <p className="mt-3 text-xs leading-relaxed text-amber-200/90 [word-break:keep-all]">
+            위 숫자는 실제로 만들어진 파일의 내용입니다. 사양에는 있었지만 파일에 들어가지 못한
+            요소가 있습니다:{" "}
+            {skipped.map(({ label, missing }) => `${label} ${missing}개`).join(", ")}. 아래
+            경고 목록에서 이유를 확인하세요.
+          </p>
+        ) : null}
+        {rendered === null ? (
+          <p className="mt-3 text-xs leading-relaxed text-slate-400 [word-break:keep-all]">
+            미리보기를 만들지 못해 위 숫자는 파일이 아니라 요청한 사양을 기준으로 표시했습니다.
+            건너뛴 요소가 있으면 아래 경고 목록에 남아 있습니다.
+          </p>
+        ) : null}
       </div>
 
       {dropped.length > 0 ? (
@@ -170,12 +231,20 @@ export default function ResultView({
           <div className="mb-2 flex items-center gap-2">
             <Info aria-hidden="true" className="h-4 w-4 text-slate-400" />
             <h3 className="text-sm font-semibold text-slate-200">
-              렌더링 조정 {warnings.length}건
+              렌더링 알림 {warnings.length}건
             </h3>
           </div>
-          <p className="mb-3 text-xs leading-relaxed text-slate-400">
-            해당 요소는 슬라이드에 들어 있지만, 슬라이드 안에 들어가도록 크기나 위치가
-            조정되었습니다. 위 미리보기에 조정된 결과가 그대로 반영되어 있습니다.
+          {/* This copy used to promise that every warned element was on the
+              slide, merely resized or moved. An `image` element with no source
+              image to crop from, or one the anti-flattening rule refused, is
+              reported in the same array and is NOT on the slide - the warning
+              body itself says "was NOT rendered". So the sentence covers both
+              outcomes and points at the preview, which is read back from the
+              file either way. */}
+          <p className="mb-3 text-xs leading-relaxed text-slate-400 [word-break:keep-all]">
+            아래 요소는 슬라이드에 들어가도록 크기나 위치가 조정되었거나, 그리지 못해
+            건너뛰어졌습니다. 어느 쪽이든 위 미리보기는 실제로 만들어진 파일을 그대로 보여 줍니다.
+            각 줄의 내용에서 어떤 경우인지 확인할 수 있습니다.
           </p>
           {/* Same containment as the dropped list above: a warning is
               forwarded stderr, so its length and content are the core's, not

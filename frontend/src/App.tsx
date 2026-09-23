@@ -28,6 +28,7 @@ import FileUploader from "./components/FileUploader";
 import OptionPanel from "./components/OptionPanel";
 import ResultView from "./components/ResultView";
 import SpecEditor from "./components/SpecEditor";
+import { renderedCounts } from "./types/slide";
 import type {
   ApiError,
   BuiltDeck,
@@ -73,9 +74,21 @@ interface EditedOutcome {
   preview: SlidePreview | null;
 }
 
-/** "파일명: 도형 3개, 표 1개, 텍스트 상자 6개, 연결선 2개 - 요소 2개 건너뜀" */
-function describeDeck(deck: BuiltDeck): string {
-  const counts = deck.counts;
+/**
+ * "파일명 다운로드: 도형 3개, 표 1개, 텍스트 상자 6개, 연결선 2개 - 요소 2개 건너뜀"
+ *
+ * `rendered` is the tally of what the DECK holds, read off the deck-derived
+ * preview; pass it whenever the file being downloaded is the one the preview on
+ * screen describes. Without it the only numbers available are
+ * `X-Element-Counts`, which the backend derives from the spec - what was
+ * REQUESTED - and an `image` element the builder had to skip would then be
+ * announced as part of a file that does not contain it. So when `rendered` is
+ * absent the line says the numbers are the spec's, rather than overstating the
+ * file to a screen reader that cannot see the preview.
+ */
+function describeDeck(deck: BuiltDeck, rendered?: ElementCounts | null): string {
+  const counts = rendered ?? deck.counts;
+  const basis = rendered ? "" : counts ? " (사양 기준)" : "";
   // 연결선/이미지 are appended only when there are some. The three original
   // tallies are always shown, but a diagram-less slide reporting "연결선 0개,
   // 이미지 0개" would be noise on every single download; omitting a zero
@@ -98,7 +111,7 @@ function describeDeck(deck: BuiltDeck): string {
     deck.droppedCount && deck.droppedCount > 0
       ? ` - 요소 ${deck.droppedCount}개 건너뜀`
       : "";
-  return `${deck.filename} 다운로드: ${tally}${droppedNote}`;
+  return `${deck.filename} 다운로드: ${tally}${basis}${droppedNote}`;
 }
 
 export default function App() {
@@ -424,7 +437,10 @@ export default function App() {
       if (edited) {
         const deck = await buildFromJson(edited.payload, result.filename);
         saveBlob(deck.blob, deck.filename);
-        setNote(describeDeck(deck));
+        // The deck was just rebuilt from `edited.payload`, which is the very
+        // spec `edited.preview` was derived from, so the preview's tally really
+        // does describe this file.
+        setNote(describeDeck(deck, renderedCounts(edited.preview)));
       } else {
         await downloadResult(result.download_id, result.filename);
       }

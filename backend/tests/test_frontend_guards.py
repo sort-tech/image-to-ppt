@@ -811,3 +811,140 @@ class TestTheKoreanBannerDoesNotStackEnglishUnderneath:
                 assert HANGUL.search(match.group(1)), (
                     f"ERROR_COPY.{code}.{field} is not Korean: {match.group(1)!r}"
                 )
+
+
+# --------------------------------------------------------------------------- #
+# The preview must draw the route the deck draws, not an approximation of it
+# --------------------------------------------------------------------------- #
+class TestTheElbowPreviewMatchesTheDecksOwnRoute:
+    """``bentConnector3`` routes in THREE legs: dx/2, the whole dy, then dx/2.
+
+    So it both LEAVES and ARRIVES horizontally, and both of its arrowheads are
+    horizontal whichever way the line runs. The preview drew ONE bend and chose
+    the leg order from ``dx >= dy``, which left the first or the last segment
+    vertical - and an SVG ``<marker>`` orients to its segment, so at least one
+    arrowhead pointed 90 degrees away from what the .pptx shows. The route is
+    fully determined by the two endpoints (the builder never overrides the
+    preset's ``adj1``), so there is nothing to approximate.
+    """
+
+    def source(self) -> str:
+        return source("components", "SlidePreview.tsx")
+
+    def test_the_route_has_three_legs_bending_at_the_midpoint(self):
+        text = self.source()
+        assert "const mx = (x1 + x2) / 2;" in text, (
+            "the bend is no longer taken at the midpoint, which is where the "
+            "preset's default adj1 (50000) puts it"
+        )
+        assert "`M ${x1} ${y1} L ${mx} ${y1} L ${mx} ${y2} L ${x2} ${y2}`" in text, (
+            "the elbow is not drawn as the deck's three-segment route, so an "
+            "arrowhead can point the wrong way again"
+        )
+
+    def test_the_leg_order_is_no_longer_guessed_from_the_aspect(self):
+        text = self.source()
+        assert "dx >= dy" not in text, (
+            "the two-segment branch is back: it makes marker-start or "
+            "marker-end vertical, which the deck never draws"
+        )
+        assert "near-zero" not in text, (
+            "the comment justifying the old branch claimed the preset's final "
+            "horizontal leg is near-zero; it is always dx/2"
+        )
+
+    def test_the_caption_no_longer_calls_the_route_an_approximation(self):
+        text = self.source()
+        assert "두 구간으로 근사해" not in text, (
+            "the caption still describes a two-segment approximation"
+        )
+        assert "세 구간" in text, "the caption should name the real route"
+
+
+# --------------------------------------------------------------------------- #
+# A dashed outline in the deck has to be dashed in the preview
+# --------------------------------------------------------------------------- #
+class TestThePlaceholderOutlineIsPreviewedDashed:
+    """The builder's skipped-image marker is a DASHED grey rectangle, chosen so
+    the gap does not read as slide content. The autoshape node drew every rect
+    solid, so the one cue that tells the marker from a box the analyzer asked
+    for was lost on the way to the screen.
+    """
+
+    def test_the_autoshape_node_passes_a_dash_array(self):
+        text = source("components", "SlidePreview.tsx")
+        shape_node = text.split("function AutoShapeNode", 1)[1].split(
+            "function ConnectorNode", 1
+        )[0]
+        assert 'shape.line_dash === "dashed"' in shape_node, (
+            "the autoshape branch ignores the payload's dash again"
+        )
+        assert shape_node.count("strokeDasharray={dashArray}") == 2, (
+            "both the ellipse and the rect have to carry the dash"
+        )
+
+    def test_the_payload_type_carries_the_field(self):
+        assert "line_dash: DashStyle;" in source("types", "slide.ts"), (
+            "PreviewShape lost line_dash, so the renderer cannot see it"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# The result panel may not describe elements the file does not contain
+# --------------------------------------------------------------------------- #
+class TestTheResultPanelDescribesTheFileAndNotTheRequest:
+    """``counts`` is derived from the validated spec - what was REQUESTED.
+
+    An ``image`` element is the one type that does not always reach the deck
+    (no source image to crop from, or the anti-flattening rule refused the
+    crop), so the badges were reporting "1 이미지" for a file holding none, and
+    the warnings panel's fixed copy told the user the element WAS on the slide
+    while the warning under it said "was NOT rendered".
+    """
+
+    def result_view(self) -> str:
+        return source("components", "ResultView.tsx")
+
+    def test_the_badges_read_the_deck_derived_tally(self):
+        text = self.result_view()
+        assert "renderedCounts(preview)" in text, (
+            "the panel is back to reporting the requested counts as the file"
+        )
+        assert "{shown[key] ?? 0}" in text, "a badge still reads counts[key]"
+        assert "counts[key] ?? 0" not in text
+
+    def test_a_requested_element_missing_from_the_deck_is_named(self):
+        text = self.result_view()
+        assert "skippedByType" in text, (
+            "nothing compares what was asked for with what the deck holds, so "
+            "a skipped image is silently just a smaller number"
+        )
+        assert "파일에 들어가지 못한" in text
+
+    def test_the_numbers_say_whose_they_are_when_there_is_no_preview(self):
+        text = self.result_view()
+        assert "rendered === null" in text
+        assert "요청한 사양을 기준으로" in text, (
+            "with no preview the panel shows the spec's numbers, and it has to "
+            "say so rather than presenting them as the file"
+        )
+
+    def test_the_warning_panel_no_longer_promises_the_element_is_on_the_slide(self):
+        text = self.result_view()
+        assert "슬라이드에 들어 있지만" not in text, (
+            "the panel again claims every warned element is in the slide; an "
+            "image element with no source image is not"
+        )
+        assert "건너뛰어졌습니다" in text, (
+            "the copy has to cover the skip case as well as the adjust case"
+        )
+
+    def test_the_download_announcement_says_whose_numbers_it_reads(self):
+        app = source("App.tsx")
+        assert "describeDeck(deck, renderedCounts(edited.preview))" in app, (
+            "the download note is back to announcing the spec's counts as the "
+            "contents of the file"
+        )
+        assert "사양 기준" in app, (
+            "when only the spec's counts are available the line has to say so"
+        )

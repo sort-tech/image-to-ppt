@@ -250,13 +250,20 @@ interface PreviewBox {
  */
 export type PreviewAutoShape = "rectangle" | "rounded_rectangle" | "oval" | "other";
 
-/** A native autoshape. A null colour means "none", not "black". */
+/**
+ * A native autoshape. A null colour means "none", not "black".
+ *
+ * `line_dash` matters for one shape in particular: the builder marks the bbox
+ * of an `image` element it could not render with a DASHED grey rectangle, and
+ * previewing that solid would show a box the deck does not contain.
+ */
 export interface PreviewShape extends PreviewBox {
   kind: "shape";
   autoshape: PreviewAutoShape;
   fill_color: string | null;
   line_color: string | null;
   line_width_pt: number | null;
+  line_dash: DashStyle;
 }
 
 /** One paragraph of a text box. `font_size_pt` is never null (see the docs). */
@@ -371,6 +378,48 @@ export interface SlidePreview {
   slide: PreviewSlide;
   background_color: string | null;
   shapes: PreviewShapeItem[];
+}
+
+/**
+ * Per-type tallies of what the BUILT deck really holds.
+ *
+ * Read off the preview payload, which the backend derives from the built
+ * `Presentation` - so this is a statement about the .pptx.
+ *
+ * `counts` in the response is a different number: it is derived from the
+ * validated `SlideSpec`, i.e. what was REQUESTED. For every type but one the
+ * two agree, because a validated element reaches the deck. An `image` element
+ * does not: the builder legitimately skips it when there is no source image to
+ * crop from (`/api/preview`, `/api/build-from-json`) or when the
+ * anti-flattening rule refuses the crop, and in the second case not even a
+ * placeholder outline is left. Showing the request as though it were the file
+ * is the overclaim this helper exists to avoid.
+ *
+ * Returns null when there is no preview to read. A caller must then say whose
+ * numbers it is showing rather than passing the request off as the file.
+ */
+export function renderedCounts(
+  preview: SlidePreview | null | undefined,
+): ElementCounts | null {
+  const shapes = preview?.shapes;
+  if (!Array.isArray(shapes)) return null;
+  const counts: ElementCounts = { shape: 0, table: 0, text: 0, connector: 0, image: 0 };
+  for (const item of shapes) {
+    switch (item?.kind) {
+      case "shape":
+      case "table":
+      case "text":
+      case "connector":
+      case "image":
+        counts[item.kind] += 1;
+        break;
+      default:
+        // `unsupported` is the degrade path and belongs to no element type;
+        // counting it under one would be a guess.
+        break;
+    }
+  }
+  return counts;
 }
 
 /* -------------------------------------------------------------------------- */
