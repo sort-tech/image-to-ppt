@@ -108,7 +108,8 @@ Needs **Python 3.10+** and **Node 18+** on `PATH`. Everything else is installed
 for you.
 
 ```bash
-cd /Users/yan/works/image-to-ppt
+git clone https://github.com/sort-tech/image-to-ppt
+cd image-to-ppt
 export LITELLM_API_KEY='<your proxy key>'   # or put it in .env (git-ignored)
 ./run.sh
 ```
@@ -141,7 +142,7 @@ proxies `/api` through to the backend, so requests are same-origin.
 ./run.sh help         # usage
 ```
 
-It resolves its own directory, so `/Users/yan/works/image-to-ppt/run.sh` works
+It resolves its own directory, so `/path/to/image-to-ppt/run.sh` works
 from anywhere. It refuses to start - naming the port, the PID and the `kill`
 command - if :8000 or :5173 is already taken, and it warns (but still starts)
 when `LITELLM_API_KEY` is unset, because the spec-driven endpoints
@@ -165,7 +166,7 @@ frontend build.
 **Backend** (terminal 1):
 
 ```bash
-cd /Users/yan/works/image-to-ppt
+cd image-to-ppt
 python3 -m venv .venv                       # first time only
 .venv/bin/python -m pip install -r backend/requirements.txt
 export LITELLM_API_KEY='<your proxy key>'   # skip for /api/preview + /api/build-from-json
@@ -184,7 +185,7 @@ FastAPI also serves interactive docs at <http://127.0.0.1:8000/docs>.
 **Frontend** (terminal 2):
 
 ```bash
-cd /Users/yan/works/image-to-ppt/frontend
+cd image-to-ppt/frontend
 npm install                                 # first time, or after package.json changes
 npm run dev                                 # http://localhost:5173/
 ```
@@ -193,7 +194,7 @@ npm run dev                                 # http://localhost:5173/
 like):
 
 ```bash
-cd /Users/yan/works/image-to-ppt/frontend
+cd image-to-ppt/frontend
 npm run build                               # type-checks, then writes dist/
 npm run preview                             # serves dist/ on :5173
 ```
@@ -907,7 +908,7 @@ behaviour. It shares the conversion core with the API, so a spec produced by
 one is buildable by the other.
 
 ```bash
-cd /Users/yan/works/image-to-ppt/backend
+cd image-to-ppt/backend
 ../.venv/bin/python cli.py --input sample.png --output result.pptx
 ```
 
@@ -929,7 +930,7 @@ or unsupported input.
 All of these run from `backend/`; `PY=../.venv/bin/python`.
 
 ```bash
-cd /Users/yan/works/image-to-ppt/backend
+cd image-to-ppt/backend
 PY=../.venv/bin/python
 
 # 0. make yourself an input image (no assets required)
@@ -974,8 +975,8 @@ $PY cli.py -i sample.png -v -o /tmp/verbose.pptx
 or each half on its own:
 
 ```bash
-cd /Users/yan/works/image-to-ppt/backend && ../.venv/bin/python -m pytest -q
-cd /Users/yan/works/image-to-ppt/frontend && npm run typecheck
+cd image-to-ppt/backend && ../.venv/bin/python -m pytest -q
+cd image-to-ppt/frontend && npm run typecheck
 ```
 
 `backend/pytest.ini` pins `testpaths = tests` and `pythonpath = .`, so a bare
@@ -1033,7 +1034,7 @@ whole build path - schema validation, native shapes/tables/text boxes, the 16:9
 slide - runs with no network at all:
 
 ```bash
-cd /Users/yan/works/image-to-ppt/backend \
+cd image-to-ppt/backend \
   && ../.venv/bin/python -c "from app import mock_data; print(mock_data.SAMPLE_SPEC_JSON)" > /tmp/spec.json \
   && ../.venv/bin/python cli.py --from-json /tmp/spec.json -o /tmp/demo.pptx \
   && open /tmp/demo.pptx
@@ -1158,7 +1159,7 @@ will be refused. Use `http://localhost:5173`, or go through the proxy.
 `.jpeg` and `.webp` are accepted. Convert first:
 
 ```bash
-cd /Users/yan/works/image-to-ppt
+cd image-to-ppt
 .venv/bin/python -c "from PIL import Image; Image.open('in.tiff').convert('RGB').save('in.png')"
 ```
 
@@ -1172,7 +1173,7 @@ fails in milliseconds rather than coming back as a puzzling 400 from the proxy.
 nothing from 40 megapixels:
 
 ```bash
-cd /Users/yan/works/image-to-ppt
+cd image-to-ppt
 .venv/bin/python -c "from PIL import Image; im=Image.open('big.png'); im.thumbnail((2000,2000)); im.save('small.png')"
 ```
 
@@ -1217,7 +1218,7 @@ get the rest of the slide.
 only when `package.json` is newer than `node_modules`. Force it:
 
 ```bash
-cd /Users/yan/works/image-to-ppt/frontend && rm -rf node_modules && npm install
+cd image-to-ppt/frontend && rm -rf node_modules && npm install
 ```
 
 **The venv is wrong or half-installed.** `run.sh` skips `pip install` when
@@ -1225,5 +1226,5 @@ cd /Users/yan/works/image-to-ppt/frontend && rm -rf node_modules && npm install
 if it is beyond repair, delete it and let the script rebuild:
 
 ```bash
-cd /Users/yan/works/image-to-ppt && rm -rf .venv && ./run.sh test
+cd image-to-ppt && rm -rf .venv && ./run.sh test
 ```
