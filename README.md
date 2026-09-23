@@ -22,6 +22,11 @@ The web app and the CLI are two front doors onto **the same conversion core**
 (`backend/app/`). Nothing about the validation, the coordinate system or the
 builder changed when the UI was added.
 
+The browser UI is **in Korean** and shows a [preview of the
+slide](#preview-before-download) before you download it. The API and the CLI
+stay English: codes like `invalid_spec` are a contract, and the UI translates
+them on the way to the screen (`frontend/src/api/client.ts`).
+
 ---
 
 ## Contents
@@ -31,7 +36,7 @@ builder changed when the UI was added.
 - [Running it by hand](#running-it-by-hand)
 - [Environment variables](#environment-variables)
 - [Prerequisite: a LiteLLM proxy](#prerequisite-a-litellm-proxy)
-- [Mock mode](#mock-mode)
+- [Preview before download](#preview-before-download)
 - [API reference](#api-reference)
 - [The 0..1000 coordinate system](#the-01000-coordinate-system)
 - [The JSON spec format](#the-json-spec-format)
@@ -57,18 +62,21 @@ image-to-ppt/
 │   │   ├── schemas.py          the pydantic contract + tolerant validation
 │   │   ├── vision_analyzer.py  prompt, request, JSON recovery
 │   │   ├── pptx_builder.py     SlideSpec ➜ .pptx (native shapes only)
-│   │   ├── mock_data.py        a hand-built sample spec, no network needed
+│   │   ├── mock_data.py        a hand-built sample spec - a TEST FIXTURE only,
+│   │   │                       not a product feature (Mock mode is gone)
 │   │   ├── main.py             the FastAPI app: CORS, router, one error envelope
 │   │   ├── api/routes.py       the /api routes and nothing else of substance
 │   │   └── services/
-│   │       └── converter.py    framework-free orchestration, shared with the CLI
+│   │       ├── converter.py    framework-free orchestration, shared with the CLI
+│   │       └── preview.py      walks the BUILT deck -> the render-ready preview
 │   ├── cli.py                  the original CLI, preserved
 │   ├── make_sample_image.py    draws a synthetic 1600x900 test slide with Pillow
 │   ├── sample.png              a ready-made input image
 │   ├── requirements.txt
 │   ├── pytest.ini
 │   └── tests/                  test_schemas / test_pptx_builder / test_vision_analyzer
-│                               / test_cli / test_config / test_api - fully offline
+│                               / test_preview / test_cli / test_config / test_api
+│                               / test_env_file / test_frontend_guards - fully offline
 │
 └── frontend/
     ├── index.html
@@ -80,8 +88,10 @@ image-to-ppt/
     └── src/
         ├── main.tsx  App.tsx
         ├── api/client.ts       one typed wrapper per endpoint
-        ├── components/         FileUploader, OptionPanel, ResultView, SpecEditor
-        └── types/slide.ts      the SlideSpec types, mirrored from schemas.py
+        ├── components/         FileUploader, OptionPanel, SlidePreview,
+        │                       ResultView, SpecEditor
+        └── types/slide.ts      the SlideSpec + preview types, mirrored from
+                                schemas.py and services/preview.py
 ```
 
 The five core modules - `config.py`, `schemas.py`, `vision_analyzer.py`,
@@ -99,7 +109,7 @@ for you.
 
 ```bash
 cd /Users/yan/works/image-to-ppt
-export LITELLM_API_KEY='<your proxy key>'   # optional: Mock mode needs no key
+export LITELLM_API_KEY='<your proxy key>'   # or put it in .env (git-ignored)
 ./run.sh
 ```
 
@@ -134,7 +144,8 @@ proxies `/api` through to the backend, so requests are same-origin.
 It resolves its own directory, so `/Users/yan/works/image-to-ppt/run.sh` works
 from anywhere. It refuses to start - naming the port, the PID and the `kill`
 command - if :8000 or :5173 is already taken, and it warns (but still starts)
-when `LITELLM_API_KEY` is unset, because Mock mode does not need one.
+when `LITELLM_API_KEY` is unset, because the spec-driven endpoints
+(`/api/preview`, `/api/build-from-json`) work without one.
 
 Both ports can be moved when something else owns the defaults:
 
@@ -157,7 +168,7 @@ frontend build.
 cd /Users/yan/works/image-to-ppt
 python3 -m venv .venv                       # first time only
 .venv/bin/python -m pip install -r backend/requirements.txt
-export LITELLM_API_KEY='<your proxy key>'   # skip if you only use Mock mode
+export LITELLM_API_KEY='<your proxy key>'   # skip for /api/preview + /api/build-from-json
 cd backend
 ../.venv/bin/python -m uvicorn app.main:app --port 8000 --reload
 ```
@@ -269,11 +280,11 @@ unredacted upstream error is written to the **server log** instead. Set
 `I2P_DEBUG_UPSTREAM_ERRORS=1` on the server to keep the raw text in responses
 while debugging the proxy.
 
-With the variable unset or blank, a real conversion fails immediately with
+With the variable unset or blank, converting an image fails immediately with
 `503 missing_api_key` (the hint names the variable and the export) - it never
-sends a keyless request. **Mock mode, `POST /api/build-from-json`,
-`GET /api/health`, `--mock`, `--from-json` and the whole test suite need no key
-at all.**
+sends a keyless request. **`POST /api/preview`, `POST /api/build-from-json`,
+`GET /api/health`, `--from-json` and the whole test suite need no key at all**,
+because they build from a spec instead of calling the model.
 
 Other knobs are plain constants in `backend/app/config.py`: `LLM_TIMEOUT`
 (120s), `LLM_MAX_RETRIES` (2), `SLIDE_WIDTH_IN` / `SLIDE_HEIGHT_IN`
@@ -313,29 +324,58 @@ The `model_name` on the left is what you put in `VISION_MODEL`; the
 repoint or swap providers without touching this code. Any vision-capable model
 works - `gemini-flash` is just the default.
 
-The proxy must be reachable **before** a real conversion. Mock mode and
-`POST /api/build-from-json` do not need it at all.
+The proxy must be reachable **before** an image can be converted.
+`POST /api/preview` and `POST /api/build-from-json` do not need it at all.
 
 ---
 
-## Mock mode
+## Preview before download
 
-Mock mode builds a deck from `mock_data.sample_spec()` - a hand-written spec
-with shapes, a table and text - with **no network call, no image and no API
-key**. It is the fastest way to prove the builder, the download flow and the UI
-all work before you point anything at a live model.
+Every conversion comes back with a **`preview`**: a render-ready description of
+the slide, which the UI draws as an SVG so you see the deck *before* you decide
+to download it. `POST /api/preview` re-derives it from an edited spec, so the
+loop is `convert` → look → edit the spec → `preview` → download.
+
+The preview is read out of **the `Presentation` object that was actually
+built** - `services/preview.py` walks `slide.shapes` and reports each shape's
+real geometry and styling. It never looks at the `SlideSpec`. That is the whole
+point: re-deriving it from the spec would be a second implementation of
+`pptx_builder.scale_bbox`, and the moment the two disagreed you would be looking
+at a picture of a slide that does not exist. Reading the built deck means the
+preview shows, for free:
+
+| shown by construction | because |
+| --- | --- |
+| the min-dimension floor | a 5-unit-high band is previewed at the 0.05in it was enlarged to, not at the 0.0375in the spec asked for |
+| off-slide clipping | a bbox that overshot 1000 is previewed where it really landed |
+| cleaned text | control characters dropped, CRLF split into paragraphs, lone surrogates replaced - the runs are read back out of the deck |
+| z-order | `slide.shapes` is in document order, which *is* the z-order, back to front |
+
+Geometry is emitted as **percentages of the slide** (so the UI is trivially
+responsive) and font sizes in **points** (the slide is 960 x 540pt, so an SVG
+with `viewBox="0 0 960 540"` maps one point to one user unit). Percentages are
+deliberately **not** clamped - a shape may legitimately sit partly off-slide,
+and clipping it is the renderer's job.
+
+Deriving the preview can never fail a conversion: any error leaves
+`"preview": null` and adds a line to `warnings`, and the deck is still built and
+still downloadable.
 
 ```bash
-# HTTP: the file field is still required, but its bytes are never sent anywhere
-curl -s -F 'file=@backend/sample.png' -F 'is_mock=true' \
-     http://127.0.0.1:8000/api/convert | head -c 400
-
-# CLI: no image at all
-cd backend && ../.venv/bin/python cli.py --mock -o /tmp/demo.pptx
+# see what a spec really builds, without storing anything
+curl -s -H 'Content-Type: application/json' \
+     --data '{"elements":[{"type":"shape","shape":"rectangle","bbox":{"x":100,"y":100,"w":500,"h":5}}]}' \
+     http://127.0.0.1:8000/api/preview
+# -> height_pct 0.6667 (= 0.05in, the FLOOR) with the matching warning,
+#    not the 0.5 the spec's h=5 would suggest
 ```
 
-In the UI it is a checkbox. `is_mock=true` also accepts the strings `"true"` /
-`"false"`, and it suppresses `503 missing_api_key` entirely.
+> **Mock mode has been removed** from the whole product - the UI toggle, the
+> `is_mock` API field and the CLI's `--mock` flag are all gone.
+> `backend/app/mock_data.py` stays as the test suite's shared fixture
+> (`sample_spec()`); it is not reachable from any user-facing code path.
+> `POST /api/preview` and `POST /api/build-from-json` are what now cover
+> "prove the builder and the UI work without a live model".
 
 ---
 
@@ -386,7 +426,10 @@ curl -s http://127.0.0.1:8000/api/health
 | `file` | file | **yes** | the image (`.png`, `.jpg`, `.jpeg`, `.webp`), max 20 MB |
 | `model` | string | no | overrides `VISION_MODEL` for this request |
 | `extra_instructions` | string | no | appended to the user prompt sent to the model |
-| `is_mock` | bool | no | default `false`; `"true"` / `"false"` strings accepted |
+
+There is no `is_mock` field. An extra form field is ignored, so a stale client
+that still posts `is_mock=true` gets an ordinary conversion - and still a
+`503 missing_api_key` without a key.
 
 ```json
 {
@@ -396,6 +439,7 @@ curl -s http://127.0.0.1:8000/api/health
   "dropped": ["element 1 (table): data - Field required"],
   "warnings": ["bbox (505, 601, 461, 6): height is below the 0.05in minimum; enlarged it so the element stays visible. ..."],
   "spec": { "background_color": "#FFFFFF", "elements": [] },
+  "preview": { "slide": {}, "background_color": "#FFFFFF", "shapes": [] },
   "download_id": "0f3c9a1b2d4e4f6a8b0c1d2e3f405162",
   "filename": "sample.pptx"
 }
@@ -409,12 +453,13 @@ one warning about the 6-unit-high band.)
 `dropped` and `warnings` are **always arrays** - empty when nothing happened.
 `spec` is the validated `SlideSpec` as JSON and **never contains a `dropped`
 key** (diagnostics are output-only, so they cannot be forged; see
-[the spec format](#the-json-spec-format)). Fetch the deck itself with the
-`download_id`.
+[the spec format](#the-json-spec-format)). `preview` is the render-ready
+description of the built deck, or `null` with a line in `warnings` if deriving
+it failed - see [`POST /api/preview`](#post-apipreview-applicationjson--200) for
+its shape. Fetch the deck itself with the `download_id`.
 
 ```bash
-curl -s -F 'file=@backend/sample.png' -F 'is_mock=true' \
-     http://127.0.0.1:8000/api/convert
+curl -s -F 'file=@backend/sample.png' http://127.0.0.1:8000/api/convert
 ```
 
 Errors:
@@ -425,15 +470,92 @@ Errors:
 | 400 | `empty_file` | zero bytes |
 | 400 | `not_an_image` | the bytes are not a decodable image |
 | 413 | `file_too_large` | over the 20 MB cap |
-| 503 | `missing_api_key` | `LITELLM_API_KEY` unset/blank. The hint names the variable, the export, and the fact that Mock mode needs no key. **Never raised when `is_mock` is true** |
+| 503 | `missing_api_key` | `LITELLM_API_KEY` unset/blank. The hint names the variable, the export, and the fact that `/api/preview` and `/api/build-from-json` need no key |
 | 502 | `proxy_unreachable` | the proxy could not be reached (the hint names `LITELLM_BASE_URL`) |
 | 502 | `analysis_failed` | the model replied but the reply could not be used |
 | 500 | `build_failed` | the deck could not be built - and the code for any other unexpected failure of the pipeline, so this table is the whole error surface |
 
+### `POST /api/preview` (`application/json`) → 200
+
+What a spec really builds, without storing anything: the deck is built so the
+geometry reported is python-pptx's own (floors and clipping included), then the
+bytes are thrown away. No model call, no key, no network. This is what the UI
+calls to refresh the slide after you edit a spec.
+
+The body is read exactly as `/api/build-from-json` reads it - a bare
+`SlideSpec`, a wrapper `{"spec": {...}}` or a bare element array all work, via
+the same `normalize_spec_payload`.
+
+The response is the `POST /api/convert` response **without** `download_id` and
+`filename`, because nothing is kept:
+
+```json
+{
+  "status": "success",
+  "counts": { "shape": 4, "table": 1, "text": 9 },
+  "total": 14,
+  "dropped": [],
+  "warnings": [],
+  "spec": { "background_color": "#FFFFFF", "elements": [] },
+  "preview": {
+    "slide": { "width_in": 13.333, "height_in": 7.5, "width_pt": 959.98, "height_pt": 540.0 },
+    "background_color": "#FFFFFF",
+    "shapes": [
+      { "kind": "shape", "autoshape": "rectangle",
+        "left_pct": 0.0, "top_pct": 0.0, "width_pct": 100.0, "height_pct": 15.6,
+        "fill_color": "#1D356A", "line_color": null, "line_width_pt": null },
+      { "kind": "text",
+        "left_pct": 2.8, "top_pct": 5.0, "width_pct": 38.0, "height_pct": 5.0,
+        "align": "left",
+        "paragraphs": [
+          { "text": "Quarterly Platform Review", "font_size_pt": 32.0,
+            "font_color": "#FFFFFF", "bold": false, "align": "left" }
+        ] },
+      { "kind": "table",
+        "left_pct": 50.5, "top_pct": 20.4, "width_pct": 46.0, "height_pct": 32.5,
+        "col_widths_pct": [33.3333, 33.3333, 33.3333],
+        "row_heights_pct": [33.3333, 33.3333, 33.3333],
+        "rows": [
+          [ { "text": "Region", "fill_color": "#1D356A", "font_size_pt": 10.0,
+              "font_color": "#FFFFFF", "bold": true, "align": "center" } ]
+        ] }
+    ]
+  }
+}
+```
+
+Rules the payload keeps:
+
+- `shapes` is already in **z-order**, back to front - it is `slide.shapes` in
+  document order, and sorting it would be the bug.
+- every numeric field is a **JSON number**, never a string; `left_pct`/`width_pct`
+  are percentages of the slide's **width**, `top_pct`/`height_pct` of its
+  **height**, and they are **not clamped**.
+- `col_widths_pct` / `row_heights_pct` are percentages of the **table's own**
+  box, each summing to ~100, so the UI's grid fills its frame exactly.
+- a `null` colour means **no fill / no outline / inherited** - see-through, never
+  a guess and never black. Only an explicit RGB is reported.
+- `font_size_pt` falls back to the builder's own default
+  (`DEFAULT_TEXT_FONT_SIZE` 12pt / `DEFAULT_TABLE_FONT_SIZE` 10pt) when a run
+  carries no explicit size, so the UI never has to guess.
+- a shape python-pptx reports as a **picture** would come back as
+  `{"kind": "unsupported"}` rather than crashing. The builder emits none, ever -
+  `X-Element-Counts` and the suite both pin that.
+
+```bash
+curl -s -H 'Content-Type: application/json' \
+     --data '{"elements":[{"type":"text","bbox":[100,100,500,100],"content":"hello"}]}' \
+     http://127.0.0.1:8000/api/preview
+```
+
+Errors: **400 `invalid_spec`** and **500 `build_failed`**, the same envelope and
+the same two codes as `/api/build-from-json`.
+
 ### `POST /api/build-from-json` (`application/json`) → 200, binary
 
 Rebuild a deck from a spec you already have - no model call, no key, no
-network. Free, and the way to iterate on geometry by hand.
+network. Free, and the way to iterate on geometry by hand. Unchanged by the
+preview work: it still answers with the binary.
 
 The body may be a bare `SlideSpec`, a wrapper `{"spec": {...}}`, or a bare
 element array; `normalize_spec_payload` recovers all three. Optional
@@ -651,8 +773,10 @@ A box that has to be moved, trimmed or enlarged to render also **warns**, so
 the geometry you see is never quietly different from the geometry the spec
 asked for.
 
-Live copies of this example: `mock_data.SAMPLE_SPEC_JSON` (string) and
-`mock_data.sample_spec()` (validated object).
+Live copies of this example live in the test fixture
+`backend/app/mock_data.py`: `SAMPLE_SPEC_JSON` (string) and `sample_spec()`
+(validated object). That module is a **fixture the suite shares**, not a
+product feature - nothing a user can reach imports it.
 
 ---
 
@@ -669,12 +793,11 @@ cd /Users/yan/works/image-to-ppt/backend
 
 | flag | description |
 | --- | --- |
-| `-i`, `--input PATH` | image to analyze. Required unless `--from-json` or `--mock`. Supported: `.png`, `.jpg`, `.jpeg`, `.webp` |
+| `-i`, `--input PATH` | image to analyze. Required unless `--from-json`. Supported: `.png`, `.jpg`, `.jpeg`, `.webp` |
 | `-o`, `--output PATH` | output `.pptx`. Defaults to the input stem (`shot.png` ➜ `shot.pptx`), or `out.pptx` |
 | `-m`, `--model NAME` | override `VISION_MODEL` / `DEFAULT_MODEL` for this run |
 | `--from-json PATH` | skip the LLM entirely and build from a saved spec |
 | `--save-json PATH` | also write the validated spec to `PATH` as JSON, for inspection or reuse with `--from-json` |
-| `--mock` | build from `mock_data.sample_spec()`; no network, no image needed |
 | `--extra TEXT` | extra instruction appended to the user prompt |
 | `-v`, `--verbose` | tracebacks and payload diagnostics |
 
@@ -707,8 +830,9 @@ $PY cli.py -i sample.png --extra "The right column is a 4-row table, not text."
 #    "Unknown model" under Troubleshooting for how to list them)
 $PY cli.py -i sample.png -m <another-model-your-proxy-serves> -o /tmp/other.pptx
 
-# 5. no proxy, no image, no network: prove the builder works
-$PY cli.py --mock -o /tmp/demo.pptx
+# 5. no proxy, no key, no network: prove the builder works from a saved spec
+$PY cli.py -i sample.png --save-json /tmp/spec.json -o /tmp/first.pptx
+$PY cli.py --from-json /tmp/spec.json -o /tmp/demo.pptx
 
 # 6. diagnose a bad run
 $PY cli.py -i sample.png -v -o /tmp/verbose.pptx
@@ -754,7 +878,7 @@ Coverage highlights:
   alignment, graceful degradation of bad colours, one broken element not
   aborting the build, and **the reopened deck containing no picture shapes and
   no `ppt/media/` parts**.
-- `tests/test_cli.py` - `--mock`, `--from-json`, `--save-json`, flag
+- `tests/test_cli.py` - `--from-json`, `--save-json`, `--mock` being gone, flag
   forwarding, exit codes (0/1/2), friendly errors without tracebacks, and the
   Pillow sample-image generator.
 - `tests/test_config.py` - the API-key contract, and a scan of the **whole
@@ -769,7 +893,7 @@ Coverage highlights:
 Quick manual smoke test, no proxy required:
 
 ```bash
-cd /Users/yan/works/image-to-ppt/backend && ../.venv/bin/python cli.py --mock -o /tmp/demo.pptx && open /tmp/demo.pptx
+cd /Users/yan/works/image-to-ppt/backend && ../.venv/bin/python cli.py -i sample.png -o /tmp/demo.pptx && open /tmp/demo.pptx
 ```
 
 ---
@@ -835,12 +959,12 @@ echo "LITELLM_API_KEY=<your proxy key>" >> .env    # git-ignored, auto-loaded
 5. **Confirm what the app actually sees** (prints names, never values):
 
    ```bash
-   cd backend && ../.venv/bin/python cli.py --mock -o /tmp/probe.pptx -v 2>&1 | grep '.env'
+   cd backend && ../.venv/bin/python cli.py -i sample.png -o /tmp/probe.pptx -v 2>&1 | grep '.env'
    curl -s localhost:8000/api/health | grep -o '"api_key_configured":[a-z]*'
    ```
 
-Or stay offline: tick **Mock mode** in the UI, send `is_mock=true`, or use
-`--mock` / `--from-json`, none of which need a key.
+Or stay offline with the spec-driven paths: `POST /api/preview`,
+`POST /api/build-from-json` or `--from-json`, none of which need a key.
 
 **`502 proxy_unreachable`** / `Connection refused`. The LiteLLM proxy is not
 running, or `LITELLM_BASE_URL` points somewhere else. Remember the URL needs
@@ -851,7 +975,7 @@ curl -s http://localhost:4000/health/readiness
 curl -s http://127.0.0.1:8000/api/health        # shows the base_url in use
 ```
 
-Meanwhile Mock mode and `POST /api/build-from-json` still work.
+Meanwhile `POST /api/preview` and `POST /api/build-from-json` still work.
 
 **`401` / `403` from the proxy** (surfaces as `502 analysis_failed`).
 `LITELLM_API_KEY` is set but does not match what the proxy expects

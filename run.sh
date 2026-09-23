@@ -151,9 +151,11 @@ load_env_file() {
 check_api_key() {
     if [ -z "${LITELLM_API_KEY:-}" ]; then
         warn "LITELLM_API_KEY is unset (or blank) - starting anyway.
-           Mock mode needs no key: tick \"Mock mode\" in the UI, POST /api/convert with
-           is_mock=true, or run 'python cli.py --mock'. Real conversions will come back
-           503 missing_api_key until you set a key. Either export it in THIS shell:
+           Converting an image needs a key: POST /api/convert and 'python cli.py -i'
+           come back 503/exit non-zero with missing_api_key until you set one. The
+           spec-driven paths need none and keep working: POST /api/preview,
+           POST /api/build-from-json, 'python cli.py --from-json', GET /api/health
+           and the whole test suite. Either export the key in THIS shell:
              export LITELLM_API_KEY='<your proxy key>'
            or put it in $ROOT/.env (git-ignored, loaded automatically):
              LITELLM_API_KEY=<your proxy key>"
