@@ -19,6 +19,7 @@
 #
 # Env read (never written to a file - see README.md):
 #   LITELLM_BASE_URL  LITELLM_API_KEY  VISION_MODEL
+#   or, with no proxy: PROVIDER=gemini|openai  GEMINI_API_KEY|OPENAI_API_KEY  PROVIDER_MODEL
 #
 set -euo pipefail
 
@@ -149,6 +150,16 @@ load_env_file() {
 }
 
 check_api_key() {
+    case "${PROVIDER:-}" in
+        gemini|openai)
+            local kv="GEMINI_API_KEY"; [ "$PROVIDER" = openai ] && kv="OPENAI_API_KEY"
+            if [ -z "${!kv:-}" ]; then
+                warn "PROVIDER=$PROVIDER but $kv is unset - starting anyway; converting an image will answer 503 until you export it."
+            else
+                log "PROVIDER=$PROVIDER, $kv is set (value not shown)."
+            fi
+            return ;;
+    esac
     if [ -z "${LITELLM_API_KEY:-}" ]; then
         warn "LITELLM_API_KEY is unset (or blank) - starting anyway.
            Converting an image needs a key: POST /api/convert and 'python cli.py -i'

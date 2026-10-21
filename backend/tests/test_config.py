@@ -257,3 +257,57 @@ class TestTheOfflinePathsNeedNoKey:
         out = tmp_path / "fromjson.pptx"
         assert cli.main(["--from-json", str(spec), "-o", str(out)]) == 0
         assert out.is_file() and out.stat().st_size > 0
+
+
+class TestDirectProvider:
+    """PROVIDER=gemini|openai talks to the provider itself, no LiteLLM proxy."""
+
+    @staticmethod
+    def _reload(monkeypatch, **env):
+        import importlib
+
+        for name in ("PROVIDER", "PROVIDER_MODEL", "GEMINI_API_KEY", "OPENAI_API_KEY",
+                     "LITELLM_BASE_URL", "LITELLM_API_KEY", "VISION_MODEL"):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        return importlib.reload(config)
+
+    def teardown_method(self):
+        import importlib
+
+        importlib.reload(config)
+
+    def test_gemini_uses_its_endpoint_key_and_default_model(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="gemini", GEMINI_API_KEY="g-key")
+        assert cfg.LITELLM_BASE_URL.startswith("https://generativelanguage.googleapis.com/")
+        assert cfg.LITELLM_API_KEY == "g-key"
+        assert cfg.DEFAULT_MODEL == "gemini-3.8-flash"
+
+    def test_openai_and_model_override(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="OpenAI", OPENAI_API_KEY="o-key",
+                           PROVIDER_MODEL="gpt-4o")
+        assert cfg.LITELLM_BASE_URL == "https://api.openai.com/v1/"
+        assert (cfg.LITELLM_API_KEY, cfg.DEFAULT_MODEL) == ("o-key", "gpt-4o")
+
+    def test_provider_wins_over_proxy_settings_and_ignores_the_other_key(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="gemini", GEMINI_API_KEY="g",
+                           OPENAI_API_KEY="o", LITELLM_API_KEY="proxy",
+                           LITELLM_BASE_URL="http://proxy:4000/", VISION_MODEL="alias")
+        assert (cfg.LITELLM_API_KEY, cfg.DEFAULT_MODEL) == ("g", "gemini-3.8-flash")
+        assert "proxy" not in cfg.LITELLM_BASE_URL
+
+    def test_missing_provider_key_is_the_normal_missing_key_error(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="gemini")
+        with pytest.raises(cfg.MissingApiKeyError):
+            cfg.get_client()
+
+    @pytest.mark.parametrize("value", ["", "litellm", "  "])
+    def test_unset_or_litellm_keeps_proxy_mode(self, monkeypatch, value):
+        cfg = self._reload(monkeypatch, PROVIDER=value, LITELLM_API_KEY="p")
+        assert cfg.PROVIDER == "" and cfg.LITELLM_API_KEY == "p"
+        assert cfg.DEFAULT_MODEL == "gemini-flash"
+
+    def test_unknown_provider_warns_and_falls_back(self, monkeypatch, capsys):
+        cfg = self._reload(monkeypatch, PROVIDER="gemni")
+        assert cfg.PROVIDER == "" and "unknown PROVIDER" in capsys.readouterr().err

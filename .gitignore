@@ -36,3 +36,6 @@ yarn-error.log*
 # Personal overrides and local state are not.
 .claude/settings.local.json
 .claude/*.local.json
+
+# try-direct.sh outputs
+direct-*.json

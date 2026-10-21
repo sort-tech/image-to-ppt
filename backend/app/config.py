@@ -36,6 +36,8 @@ def _env_text(name: str, default: str) -> str:
     return (os.environ.get(name) or "").strip() or default
 
 __all__ = [
+    "PROVIDER",
+    "PROVIDERS",
     "LITELLM_BASE_URL",
     "LITELLM_API_KEY",
     "MissingApiKeyError",
@@ -57,19 +59,55 @@ __all__ = [
 # LLM / LiteLLM proxy settings
 # --------------------------------------------------------------------------- #
 
-#: Base URL of the OpenAI-compatible LiteLLM proxy (env: ``LITELLM_BASE_URL``).
-LITELLM_BASE_URL: str = _env_text("LITELLM_BASE_URL", "http://localhost:4000/")
+#: Direct providers: name -> (OpenAI-compatible base URL, that provider's own key
+#: variable, default vision model). ``PROVIDER=gemini`` / ``openai`` skips the
+#: LiteLLM proxy and talks to the provider with its own key; anything else
+#: (unset, ``litellm``) keeps the proxy settings below.
+PROVIDERS: dict[str, tuple[str, str, str]] = {
+    "gemini": (
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "GEMINI_API_KEY",
+        "gemini-3.8-flash",
+    ),
+    "openai": ("https://api.openai.com/v1/", "OPENAI_API_KEY", "gpt-4o-mini"),
+}
 
-#: API key presented to the proxy (env: ``LITELLM_API_KEY``). There is
-#: deliberately NO default: a credential does not belong in the source tree, and
-#: a baked-in key also hides a misconfigured environment behind a 401 from the
-#: proxy. Empty means "not configured" - :func:`get_client` says so, by name,
-#: while ``--from-json`` never needs a key at all.
-LITELLM_API_KEY: str = os.environ.get("LITELLM_API_KEY", "")
+#: Selected direct provider ("" = LiteLLM proxy mode) (env: ``PROVIDER``).
+PROVIDER: str = _env_text("PROVIDER", "").lower()
+if PROVIDER in ("litellm", "proxy"):
+    PROVIDER = ""
+if PROVIDER and PROVIDER not in PROVIDERS:
+    import sys as _sys
 
-#: Vision model name routed by the proxy (env: ``VISION_MODEL``). A blank value
-#: falls back to the default - see :func:`_env_text`.
-DEFAULT_MODEL: str = _env_text("VISION_MODEL", "gemini-flash")
+    print(
+        f"[config] WARNING: unknown PROVIDER {PROVIDER!r} (use "
+        f"{' | '.join(PROVIDERS)}); falling back to the LiteLLM proxy settings.",
+        file=_sys.stderr,
+    )
+    PROVIDER = ""
+
+if PROVIDER:
+    _base, _key_var, _default_model = PROVIDERS[PROVIDER]
+    #: Base URL of the OpenAI-compatible endpoint.
+    LITELLM_BASE_URL: str = _base
+    #: The provider's own key (``GEMINI_API_KEY`` / ``OPENAI_API_KEY``).
+    LITELLM_API_KEY: str = os.environ.get(_key_var, "")
+    #: ``PROVIDER_MODEL`` overrides the provider default.
+    DEFAULT_MODEL: str = _env_text("PROVIDER_MODEL", _default_model)
+else:
+    #: Base URL of the OpenAI-compatible LiteLLM proxy (env: ``LITELLM_BASE_URL``).
+    LITELLM_BASE_URL: str = _env_text("LITELLM_BASE_URL", "http://localhost:4000/")
+
+    #: API key presented to the proxy (env: ``LITELLM_API_KEY``). There is
+    #: deliberately NO default: a credential does not belong in the source tree,
+    #: and a baked-in key also hides a misconfigured environment behind a 401
+    #: from the proxy. Empty means "not configured" - :func:`get_client` says so,
+    #: by name, while ``--from-json`` never needs a key at all.
+    LITELLM_API_KEY: str = os.environ.get("LITELLM_API_KEY", "")
+
+    #: Vision model name routed by the proxy (env: ``VISION_MODEL``). A blank
+    #: value falls back to the default - see :func:`_env_text`.
+    DEFAULT_MODEL: str = _env_text("VISION_MODEL", "gemini-flash")
 
 #: Per-request timeout in seconds. Vision calls on large images are slow.
 LLM_TIMEOUT: float = 120.0
@@ -139,6 +177,8 @@ _MISSING_KEY_HINT = (
     "    export LITELLM_API_KEY='<your proxy key>'\n"
     "  (see .env.example; keep the key in your environment, never in a file in "
     "this repository)\n"
+    "  Direct to Google/OpenAI instead? Set PROVIDER=gemini + GEMINI_API_KEY, or\n"
+    "  PROVIDER=openai + OPENAI_API_KEY (no proxy needed).\n"
     "  No key handy? '--from-json SPEC.json' builds a deck with no key and no "
     "network at all."
 )

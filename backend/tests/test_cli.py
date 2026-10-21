@@ -1003,6 +1003,15 @@ def test_full_pipeline_on_a_generated_image_yields_no_pictures(tmp_path, monkeyp
 # the README's own keyless recipes
 # =========================================================================== #
 README = Path(__file__).resolve().parents[2] / "README.md"
+DOCS = README.parent / "docs"
+
+
+def _readme_and_docs_text() -> str:
+    """README plus docs/*.md: the user-facing prose is split across them."""
+    parts = [README.read_text(encoding="utf-8")]
+    if DOCS.is_dir():
+        parts += [f.read_text(encoding="utf-8") for f in sorted(DOCS.glob("*.md"))]
+    return "\n".join(parts)
 
 #: A promise that a command needs no proxy / key / network.
 KEYLESS_CLAIM = re.compile(r"no\s+(?:proxy|key|network)", re.I)
@@ -1056,7 +1065,7 @@ def _keyless_commands(text: str | None = None) -> list[tuple[str, str]]:
     wrong sentence). Before the first comment, the lead paragraph governs.
     """
     if text is None:
-        text = README.read_text(encoding="utf-8")
+        text = _readme_and_docs_text()
     governed: list[tuple[str, str]] = []
     for lead, body in _bash_blocks(text):
         lead_claim = "\n".join(lead)
@@ -1203,7 +1212,7 @@ class TestTheReadmeStatesTheAntiFlatteningRuleThatIsActuallyInForce:
     )
 
     def test_no_superseded_flattening_claim_is_left_in_the_readme(self):
-        text = README.read_text(encoding="utf-8")
+        text = _readme_and_docs_text()
         offenders = [phrase for phrase in self.SUPERSEDED if phrase in text]
         assert offenders == [], (
             "the README still states the abandoned guarantee; the rule in force "
@@ -1212,14 +1221,14 @@ class TestTheReadmeStatesTheAntiFlatteningRuleThatIsActuallyInForce:
         )
 
     def test_the_readme_states_the_rule_that_is_in_force(self):
-        text = README.read_text(encoding="utf-8")
+        text = _readme_and_docs_text()
         assert "flattening_report" in text, "the real rule is not named anywhere"
         # The three rules, by their numbers, so a reader can check a deck.
         assert f"{int(pptx_builder.FULL_BLEED_PICTURE_PCT)}%" in text
         assert f"{int(pptx_builder.MAX_PICTURE_AREA_PCT)}%" in text
 
     def test_the_readme_documents_the_element_types_the_builder_can_emit(self):
-        text = README.read_text(encoding="utf-8")
+        text = _readme_and_docs_text()
         for token in ("connector", "start_point", "end_point", '"type": "image"'):
             assert token in text, f"the README never mentions {token!r}"
 

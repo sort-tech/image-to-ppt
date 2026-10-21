@@ -1,0 +1,41 @@
+# TRY IT (built images, no source mounts). Guide: docs/docker.md
+#
+#   PROVIDER=gemini GEMINI_API_KEY=... docker compose up --build
+#   PROVIDER=openai OPENAI_API_KEY=... docker compose up --build
+#   docker compose up --build            # keyless: preview/build-from-json only,
+#                                        # or a LiteLLM proxy via LITELLM_* below
+#
+# Open http://localhost:5173. Values come from your shell or a git-ignored ./.env.
+# Hot-reload development: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      PROVIDER: ${PROVIDER:-}
+      PROVIDER_MODEL: ${PROVIDER_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # LiteLLM-proxy mode (PROVIDER unset). "localhost" would be the container,
+      # so a proxy on your host is reached as host.docker.internal.
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      LITELLM_BASE_URL: ${DOCKER_LITELLM_BASE_URL:-http://host.docker.internal:4000/}
+      VISION_MODEL: ${VISION_MODEL:-gemini-flash}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "${WEB_PORT:-5173}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
