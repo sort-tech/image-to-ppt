@@ -150,7 +150,8 @@ class TestTheLiteralKeyIsNotInTheSourceTree:
             importlib.reload(config)
 
     def test_the_default_key_is_empty_not_a_baked_in_secret(self, monkeypatch):
-        monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+        for name in _KEY_VARS:
+            monkeypatch.delenv(name, raising=False)
         import importlib
 
         reloaded = importlib.reload(config)
@@ -158,6 +159,88 @@ class TestTheLiteralKeyIsNotInTheSourceTree:
             assert reloaded.LITELLM_API_KEY == ""
         finally:
             importlib.reload(config)
+
+
+_KEY_VARS = ("LITELLM_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+
+
+class TestOneProviderKeyIsEnough:
+    """Trying the project must not require running a LiteLLM proxy first."""
+
+    @pytest.fixture
+    def reload_with(self, monkeypatch):
+        import importlib
+
+        def _reload(**env):
+            for name in (*_KEY_VARS, "LITELLM_BASE_URL", "VISION_MODEL"):
+                monkeypatch.delenv(name, raising=False)
+            for name, value in env.items():
+                monkeypatch.setenv(name, value)
+            return importlib.reload(config)
+
+        yield _reload
+        for name in (*_KEY_VARS, "LITELLM_BASE_URL", "VISION_MODEL"):
+            monkeypatch.delenv(name, raising=False)
+        importlib.reload(config)
+
+    def test_a_gemini_key_alone_calls_gemini_directly(self, reload_with):
+        reloaded = reload_with(GEMINI_API_KEY="g-test-key")
+        assert (reloaded.PROVIDER, reloaded.KEY_SOURCE) == ("gemini", "GEMINI_API_KEY")
+        assert reloaded.LITELLM_API_KEY == "g-test-key"
+        assert "generativelanguage.googleapis.com" in reloaded.LITELLM_BASE_URL
+        assert reloaded.DEFAULT_MODEL.startswith("gemini-")
+        client = reloaded.get_client()  # no network: the SDK only stores config
+        assert "generativelanguage.googleapis.com" in str(client.base_url)
+        assert client.api_key == "g-test-key"
+
+    def test_an_openai_key_alone_calls_openai_directly(self, reload_with):
+        reloaded = reload_with(OPENAI_API_KEY="o-test-key")
+        assert reloaded.PROVIDER == "openai"
+        assert reloaded.LITELLM_BASE_URL.startswith("https://api.openai.com/")
+        assert reloaded.DEFAULT_MODEL.startswith("gpt-")
+
+    def test_the_proxy_key_wins_so_existing_setups_do_not_change(self, reload_with):
+        reloaded = reload_with(
+            LITELLM_API_KEY="sk-proxy", GEMINI_API_KEY="g-key", OPENAI_API_KEY="o-key"
+        )
+        assert (reloaded.PROVIDER, reloaded.LITELLM_API_KEY) == ("litellm", "sk-proxy")
+        assert reloaded.LITELLM_BASE_URL == "http://localhost:4000/"
+        assert reloaded.DEFAULT_MODEL == "gemini-flash"
+
+    def test_gemini_wins_over_openai(self, reload_with):
+        assert reload_with(GEMINI_API_KEY="g", OPENAI_API_KEY="o").PROVIDER == "gemini"
+
+    def test_a_blank_proxy_key_falls_through_to_the_next_source(self, reload_with):
+        """A copied .env line ``LITELLM_API_KEY=`` must not hide a real key."""
+        assert reload_with(LITELLM_API_KEY="  ", GEMINI_API_KEY="g").PROVIDER == "gemini"
+
+    def test_a_stale_proxy_url_never_receives_a_direct_provider_key(self, reload_with):
+        reloaded = reload_with(
+            GEMINI_API_KEY="g", LITELLM_BASE_URL="http://localhost:4000/"
+        )
+        assert "localhost" not in reloaded.LITELLM_BASE_URL
+
+    def test_vision_model_still_overrides_the_provider_default(self, reload_with):
+        reloaded = reload_with(GEMINI_API_KEY="g", VISION_MODEL="gemini-2.5-pro")
+        assert reloaded.DEFAULT_MODEL == "gemini-2.5-pro"
+
+    def test_an_anthropic_key_alone_calls_claude_through_its_own_sdk(self, reload_with):
+        reloaded = reload_with(ANTHROPIC_API_KEY="a-test-key")
+        assert (reloaded.PROVIDER, reloaded.KEY_SOURCE) == ("anthropic", "ANTHROPIC_API_KEY")
+        assert reloaded.DEFAULT_MODEL == "claude-opus-5-5"
+        client = reloaded.get_client()  # no network: the SDK only stores config
+        assert type(client).__name__ == "AnthropicChatClient"
+        assert client.api_key == "a-test-key"
+        assert callable(client.chat.completions.create)
+
+    def test_openai_wins_over_anthropic(self, reload_with):
+        assert reload_with(OPENAI_API_KEY="o", ANTHROPIC_API_KEY="a").PROVIDER == "openai"
+
+    def test_with_no_key_the_hint_names_every_option(self, reload_with):
+        reloaded = reload_with()
+        assert reloaded.LITELLM_API_KEY == ""
+        for name in _KEY_VARS:
+            assert name in reloaded._MISSING_KEY_HINT
 
 
 class TestGetClientRefusesWithoutAKey:

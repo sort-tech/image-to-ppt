@@ -236,7 +236,8 @@ def _failure_for(exc: BaseException) -> ConversionFailure:
         return ConversionFailure(
             503,
             "missing_api_key",
-            "LITELLM_API_KEY is not set on the server, so the note cannot be "
+            "No API key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY or "
+            "LITELLM_API_KEY) is set on the server, so the note cannot be "
             "completed.",
             converter._MISSING_KEY_HINT,
         )
@@ -246,7 +247,7 @@ def _failure_for(exc: BaseException) -> ConversionFailure:
         return ConversionFailure(
             502,
             "proxy_unreachable",
-            "The LiteLLM proxy could not be reached "
+            "The vision model endpoint could not be reached "
             f"({type(connection).__name__}: {connection}).",
             converter._proxy_unreachable_hint(),
         )

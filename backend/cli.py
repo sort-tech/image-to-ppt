@@ -413,9 +413,9 @@ def _diagnose(exc: BaseException, context: str = "llm") -> str:
         "403",
     ):
         return (
-            "The proxy rejected the credentials (authentication failure).\n"
-            f"  Current key source: LITELLM_API_KEY (base URL {config.LITELLM_BASE_URL}).\n"
-            "  Fix: export LITELLM_API_KEY=<your proxy key> and retry."
+            "The provider rejected the credentials (authentication failure).\n"
+            f"  Current key source: {config.KEY_SOURCE} (base URL {config.LITELLM_BASE_URL}).\n"
+            f"  Fix: export {config.KEY_SOURCE}=<a valid key> and retry."
         )
     if hit(
         "notfounderror",
@@ -430,10 +430,14 @@ def _diagnose(exc: BaseException, context: str = "llm") -> str:
         "404",
     ):
         return (
-            "The model was not found on the proxy.\n"
+            "The model was not found.\n"
             f"  Requested model: check --model / VISION_MODEL (default {config.DEFAULT_MODEL}).\n"
-            "  Fix: list the proxy's models (e.g. curl "
-            f"{config.LITELLM_BASE_URL.rstrip('/')}/v1/models) and pass one with --model."
+            + (
+                "  Fix: list the proxy's models (e.g. curl "
+                f"{config.LITELLM_BASE_URL.rstrip('/')}/v1/models) and pass one with --model."
+                if config.PROVIDER == "litellm"
+                else f"  Fix: pass a {config.PROVIDER} vision model name with --model."
+            )
         )
     if hit("ratelimit", "rate limit", "429", "quota", "insufficient_quota"):
         return (
@@ -456,6 +460,13 @@ def _diagnose(exc: BaseException, context: str = "llm") -> str:
         "unreachable",
         "getaddrinfo",
     ):
+        if config.PROVIDER != "litellm":
+            return (
+                f"Could not reach {config.LITELLM_BASE_URL}.\n"
+                "  Fix: check this machine's network connection and retry.\n"
+                "  Offline? `--from-json SPEC.json` exercises the whole build "
+                "path with no network."
+            )
         return (
             "Could not reach the LiteLLM proxy.\n"
             f"  Tried: {config.LITELLM_BASE_URL}\n"
@@ -726,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             applied = ", ".join(sorted(ENV_APPLIED)) or "nothing (already in the environment)"
             print(f"[verbose] .env        : {ENV_FILE} -> {applied}", file=sys.stderr)
         print(f"[verbose] base url    : {config.LITELLM_BASE_URL}", file=sys.stderr)
+        print(f"[verbose] key source  : {config.KEY_SOURCE} ({config.PROVIDER})", file=sys.stderr)
         print(
             f"[verbose] model       : {args.model or config.DEFAULT_MODEL}",
             file=sys.stderr,

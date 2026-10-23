@@ -171,6 +171,11 @@ class TestConfig:
         """
         monkeypatch.setenv("VISION_MODEL", blank)
         monkeypatch.setenv("LITELLM_BASE_URL", blank)
+        # The proxy's defaults are the ones under test. A direct-provider key -
+        # from the shell, or from a developer's .env that importing cli or
+        # app.main loads - would select another provider and its defaults.
+        for name in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
         try:
             reloaded = importlib.reload(config)
             assert reloaded.DEFAULT_MODEL == "gemini-flash"

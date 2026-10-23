@@ -1,6 +1,7 @@
 """Central configuration for the image-to-pptx Vision CLI.
 
-Holds LLM connection settings (LiteLLM proxy, OpenAI-compatible), slide geometry,
+Holds LLM connection settings (a LiteLLM proxy, or Gemini / OpenAI directly -
+all OpenAI-compatible), slide geometry,
 the normalized coordinate scale used by the vision schema, supported input image
 formats and rendering defaults.
 
@@ -38,6 +39,9 @@ def _env_text(name: str, default: str) -> str:
 __all__ = [
     "LITELLM_BASE_URL",
     "LITELLM_API_KEY",
+    "KEY_SOURCE",
+    "PROVIDER",
+    "KEY_SETUP_HELP",
     "MissingApiKeyError",
     "DEFAULT_MODEL",
     "LLM_TIMEOUT",
@@ -54,22 +58,79 @@ __all__ = [
 ]
 
 # --------------------------------------------------------------------------- #
-# LLM / LiteLLM proxy settings
+# LLM settings: a LiteLLM proxy, or Gemini / OpenAI directly
 # --------------------------------------------------------------------------- #
 
-#: Base URL of the OpenAI-compatible LiteLLM proxy (env: ``LITELLM_BASE_URL``).
-LITELLM_BASE_URL: str = _env_text("LITELLM_BASE_URL", "http://localhost:4000/")
+#: Where a key can come from, first match wins:
+#: ``(env var, provider, base URL, default model)``. The proxy comes first so an
+#: existing LiteLLM setup behaves exactly as before; the other two are there so
+#: that trying the project needs one provider key and no proxy at all - both
+#: providers speak the OpenAI chat API this client already uses. A base URL of
+#: ``None`` means "read ``LITELLM_BASE_URL``".
+_KEY_SOURCES: tuple[tuple[str, str, str | None, str], ...] = (
+    ("LITELLM_API_KEY", "litellm", None, "gemini-flash"),
+    (
+        "GEMINI_API_KEY",
+        "gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "gemini-3.8-flash",
+    ),
+    ("OPENAI_API_KEY", "openai", "https://api.openai.com/v1/", "gpt-4.1-mini"),
+    # Claude goes through the official ``anthropic`` SDK, not a compatibility
+    # endpoint - see app/anthropic_client.py.
+    ("ANTHROPIC_API_KEY", "anthropic", "https://api.anthropic.com/", "claude-opus-5-5"),
+)
 
-#: API key presented to the proxy (env: ``LITELLM_API_KEY``). There is
-#: deliberately NO default: a credential does not belong in the source tree, and
-#: a baked-in key also hides a misconfigured environment behind a 401 from the
-#: proxy. Empty means "not configured" - :func:`get_client` says so, by name,
+
+def _resolve_key_source() -> tuple[str, str, str, str, str]:
+    """``(env var, provider, key, base URL, default model)`` for this process.
+
+    With no key anywhere the proxy is reported, key empty, so every "not
+    configured" message keeps naming the variables to set.
+    """
+    for name, provider, base_url, model in _KEY_SOURCES:
+        key = (os.environ.get(name) or "").strip()
+        if key:
+            break
+    else:
+        name, provider, base_url, model = _KEY_SOURCES[0]
+        key = ""
+    if base_url is None:
+        # Only the proxy reads LITELLM_BASE_URL: a stale proxy URL left in .env
+        # must not send a Gemini key to localhost:4000.
+        base_url = _env_text("LITELLM_BASE_URL", "http://localhost:4000/")
+    elif provider == "anthropic":
+        # The anthropic SDK reads ANTHROPIC_BASE_URL itself; mirror it so the
+        # endpoint /api/health and the error hints name is the one called.
+        base_url = _env_text("ANTHROPIC_BASE_URL", base_url)
+    return name, provider, key, base_url, model
+
+
+(KEY_SOURCE, PROVIDER, LITELLM_API_KEY, LITELLM_BASE_URL, _PROVIDER_MODEL) = (
+    _resolve_key_source()
+)
+#: ``KEY_SOURCE`` is the variable that supplied the key and ``PROVIDER`` one of
+#: ``litellm`` / ``gemini`` / ``openai`` / ``anthropic``. ``LITELLM_API_KEY`` and
+#: ``LITELLM_BASE_URL`` keep their names for every caller, but hold the
+#: EFFECTIVE key and endpoint, whichever source supplied them. There is
+#: deliberately NO default key: a credential does not belong in the source
+#: tree, and a baked-in key also hides a misconfigured environment behind a
+#: 401. Empty means "not configured" - :func:`get_client` says so, by name,
 #: while ``--from-json`` never needs a key at all.
-LITELLM_API_KEY: str = os.environ.get("LITELLM_API_KEY", "")
 
-#: Vision model name routed by the proxy (env: ``VISION_MODEL``). A blank value
-#: falls back to the default - see :func:`_env_text`.
-DEFAULT_MODEL: str = _env_text("VISION_MODEL", "gemini-flash")
+#: Vision model name (env: ``VISION_MODEL``): an alias the proxy routes, or the
+#: provider's own model name when calling Gemini / OpenAI directly. A blank
+#: value falls back to the provider's default - see :func:`_env_text`.
+DEFAULT_MODEL: str = _env_text("VISION_MODEL", _PROVIDER_MODEL)
+
+#: The ways to configure a key, for every "no key" message to quote.
+KEY_SETUP_HELP = (
+    "Set ONE of these in the environment (or in .env, git-ignored):\n"
+    "    export GEMINI_API_KEY='<your Gemini key>'    # https://aistudio.google.com/apikey\n"
+    "    export OPENAI_API_KEY='<your OpenAI key>'\n"
+    "    export ANTHROPIC_API_KEY='<your Anthropic key>'\n"
+    "    export LITELLM_API_KEY='<your proxy key>'    # a LiteLLM proxy at LITELLM_BASE_URL"
+)
 
 #: Per-request timeout in seconds. Vision calls on large images are slow.
 LLM_TIMEOUT: float = 120.0
@@ -123,7 +184,7 @@ DEFAULT_BORDER_WIDTH_PT: float = 1.0
 
 
 class MissingApiKeyError(RuntimeError):
-    """``LITELLM_API_KEY`` is unset or blank, so no client can be built.
+    """No key is configured (see :data:`KEY_SETUP_HELP`), so no client can be built.
 
     A ``RuntimeError`` so existing callers that catch ``RuntimeError`` (or
     ``Exception``) keep working unchanged; a distinct class so the CLI can
@@ -133,19 +194,19 @@ class MissingApiKeyError(RuntimeError):
 
 #: The one message that explains a missing key, used by the error above.
 _MISSING_KEY_HINT = (
-    "LITELLM_API_KEY is not set (or is blank), so the LiteLLM proxy cannot be "
-    "called.\n"
-    "  Fix: export the key in your shell, then retry:\n"
-    "    export LITELLM_API_KEY='<your proxy key>'\n"
-    "  (see .env.example; keep the key in your environment, never in a file in "
-    "this repository)\n"
+    "No API key is set (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY or "
+    "LITELLM_API_KEY), so "
+    "the vision model cannot be called.\n"
+    "  Fix: " + KEY_SETUP_HELP.replace("\n", "\n  ") + "\n"
+    "  (see .env.example; keep the key in your environment, never in a file "
+    "committed to this repository)\n"
     "  No key handy? '--from-json SPEC.json' builds a deck with no key and no "
     "network at all."
 )
 
 
 def get_client() -> "openai.OpenAI":
-    """Build an OpenAI-compatible client pointed at the LiteLLM proxy.
+    """Build an OpenAI-compatible client for the configured provider.
 
     ``openai`` is imported here rather than at module scope so that importing
     ``config`` never fails when the SDK is missing.
@@ -165,11 +226,28 @@ def get_client() -> "openai.OpenAI":
     if not isinstance(api_key, str) or not api_key.strip():
         raise MissingApiKeyError(_MISSING_KEY_HINT)
 
+    if PROVIDER == "anthropic":
+        try:
+            from .anthropic_client import AnthropicChatClient
+
+            # Adaptive thinking on a vision call can outlast the 120 s that
+            # suits the other providers.
+            return AnthropicChatClient(
+                api_key=api_key,
+                timeout=max(LLM_TIMEOUT, 300.0),
+                max_retries=LLM_MAX_RETRIES,
+            )
+        except ImportError as exc:  # pragma: no cover - depends on the environment
+            raise RuntimeError(
+                "The 'anthropic' package is required for ANTHROPIC_API_KEY. "
+                "Install it with: pip install -r requirements.txt"
+            ) from exc
+
     try:
         import openai
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise RuntimeError(
-            "The 'openai' package is required to talk to the LiteLLM proxy. "
+            "The 'openai' package is required to talk to the vision model. "
             "Install it with: pip install -r requirements.txt"
         ) from exc
 

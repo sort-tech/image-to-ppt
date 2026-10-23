@@ -1,12 +1,46 @@
 # image-to-pptx
 
-Turn a picture of a slide into a **real PowerPoint slide** - in the browser, or
-from the command line.
+**Screenshot in, editable PowerPoint out.** Turn a picture of a slide into a
+**real PowerPoint slide** - in the browser, or from the command line.
+
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
 Feed it a screenshot, a scanned page, a whiteboard photo or a diagram, and it
 writes a `.pptx` whose shapes, connectors, tables and text boxes are **native,
 editable PowerPoint objects**: you can click the table and retype a cell, drag
-a box, restyle the header, re-point an arrow.
+a box, restyle the header, re-point an arrow. Many "image to PPT" converters
+paste your picture onto a slide; this one refuses to.
+
+| | typical image-to-PPT converter | image-to-pptx |
+| --- | --- | --- |
+| table | a picture of a table | a PowerPoint table - retype any cell |
+| boxes and arrows | flattened into the picture | shapes and connectors you can drag and restyle |
+| text | not editable, or one big text box | text boxes placed where the text was |
+| whole slide as one picture | yes | never - the build refuses to write it |
+
+### Try it in 30 seconds
+
+One API key is all it needs - a free [Gemini key](https://aistudio.google.com/apikey)
+works, and so do OpenAI and Anthropic (Claude) keys. No proxy, no config file.
+
+```bash
+git clone https://github.com/sort-tech/image-to-ppt
+cd image-to-ppt
+export GEMINI_API_KEY='<your Gemini key>'   # or OPENAI_API_KEY / ANTHROPIC_API_KEY
+./run.sh                                    # then open http://localhost:5173/
+```
+
+Command line instead of the browser:
+
+```bash
+.venv/bin/python backend/cli.py -i backend/sample.png -o sample.pptx
+```
+
+Already run a [LiteLLM proxy](#optional-a-litellm-proxy)? Set
+`LITELLM_API_KEY` instead and nothing else changes.
+
+### Native, not flattened
 
 The one exception is an **`image` element**: a region the analyzer genuinely
 cannot express as shape, table or text - a photo, a rendered chart, a logo -
@@ -31,7 +65,8 @@ element is skipped with a warning naming it; a flattened deck is never written.
   browser (React) ──┐
                     ├──▶ FastAPI ──▶ Vision LLM ──▶ SlideSpec (JSON) ──▶ python-pptx ──▶ .pptx
   backend/cli.py ───┘                (gemini-flash       validated                       native shapes,
-                                      via LiteLLM)       by pydantic                     tables, text
+                                      Gemini / OpenAI /  by pydantic                     tables, text
+                                      LiteLLM proxy)
 ```
 
 The web app and the CLI are two front doors onto **the same conversion core**
@@ -51,7 +86,7 @@ them on the way to the screen (`frontend/src/api/client.ts`).
 - [Quick start](#quick-start)
 - [Running it by hand](#running-it-by-hand)
 - [Environment variables](#environment-variables)
-- [Prerequisite: a LiteLLM proxy](#prerequisite-a-litellm-proxy)
+- [Optional: a LiteLLM proxy](#optional-a-litellm-proxy)
 - [Preview before download](#preview-before-download)
 - [API reference](#api-reference)
 - [The 0..1000 coordinate system](#the-01000-coordinate-system)
@@ -126,7 +161,7 @@ for you.
 ```bash
 git clone https://github.com/sort-tech/image-to-ppt
 cd image-to-ppt
-export LITELLM_API_KEY='<your proxy key>'   # or put it in .env (git-ignored)
+export GEMINI_API_KEY='<your Gemini key>'   # or OPENAI_ / ANTHROPIC_ / LITELLM_API_KEY; or put it in .env (git-ignored)
 ./run.sh
 ```
 
@@ -233,9 +268,19 @@ allow-list (`http://localhost:5173`, `http://localhost:3000`) exists for.
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `LITELLM_BASE_URL` | `http://localhost:4000/` | base URL of the OpenAI-compatible proxy. Needs the scheme |
-| `LITELLM_API_KEY` | *(empty - no default)* | key the proxy expects. **Required for a real conversion**; any value your proxy accepts will do, including a dummy one for a local proxy that does not check |
-| `VISION_MODEL` | `gemini-flash` | model / alias to request. Overridable per request (`model` field) or per run (`-m`) |
+| `GEMINI_API_KEY` | *(empty)* | call Gemini directly through its OpenAI-compatible endpoint. No proxy needed |
+| `OPENAI_API_KEY` | *(empty)* | call OpenAI directly. No proxy needed |
+| `ANTHROPIC_API_KEY` | *(empty)* | call Claude directly through the official `anthropic` SDK (Messages API - `backend/app/anthropic_client.py`). No proxy needed |
+| `LITELLM_API_KEY` | *(empty - no default)* | key a [LiteLLM proxy](#optional-a-litellm-proxy) expects; any value your proxy accepts will do, including a dummy one for a local proxy that does not check |
+| `LITELLM_BASE_URL` | `http://localhost:4000/` | base URL of the proxy. Needs the scheme. Read **only** when `LITELLM_API_KEY` is the key in use |
+| `VISION_MODEL` | `gemini-3.8-flash` (Gemini), `gpt-4.1-mini` (OpenAI), `claude-opus-5-5` (Anthropic), `gemini-flash` (proxy) | model / alias to request. Overridable per request (`model` field) or per run (`-m`) |
+
+**One key is required for a real conversion**, and the first one set wins:
+`LITELLM_API_KEY`, then `GEMINI_API_KEY`, then `OPENAI_API_KEY`, then
+`ANTHROPIC_API_KEY` - so an
+existing proxy setup is never redirected by a provider key exported for some
+other tool. `GET /api/health` reports the endpoint in use as `proxy.base_url`
+(never the key).
 
 A variable that is **present but blank** (`VISION_MODEL=` on its own line in
 `.env`) counts as unset and falls back to the default above. It used to be
@@ -320,12 +365,13 @@ Upload limits live in `backend/app/services/converter.py`:
 
 ---
 
-## Prerequisite: a LiteLLM proxy
+## Optional: a LiteLLM proxy
 
-The tool talks to an OpenAI-compatible `/chat/completions` endpoint. It does
-not call Google directly - it expects a [LiteLLM](https://docs.litellm.ai/)
-proxy in front of the vision model, so the same code works with any provider
-you can route through it.
+**Not needed** if you set `GEMINI_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` - the tool then
+calls that provider directly. The tool talks to an OpenAI-compatible
+`/chat/completions` endpoint, so a [LiteLLM](https://docs.litellm.ai/) proxy
+in front of the vision model is the way to use any other provider, or to keep
+provider keys off the machine running this tool.
 
 ```bash
 # in another terminal
@@ -336,7 +382,7 @@ cat > litellm.config.yaml <<'YAML'
 model_list:
   - model_name: gemini-flash          # the name this tool asks for
     litellm_params:
-      model: gemini/gemini-2.0-flash  # the upstream model it maps to
+      model: gemini/gemini-3.8-flash  # the upstream model it maps to
       api_key: os.environ/GEMINI_API_KEY
 YAML
 
@@ -348,7 +394,7 @@ The `model_name` on the left is what you put in `VISION_MODEL`; the
 repoint or swap providers without touching this code. Any vision-capable model
 works - `gemini-flash` is just the default.
 
-The proxy must be reachable **before** an image can be converted.
+In proxy mode, the proxy must be reachable **before** an image can be converted.
 `POST /api/preview` and `POST /api/build-from-json` do not need it at all.
 
 ---
@@ -1159,13 +1205,12 @@ server, which looks like a leftover process but is not one:
 lsof -nP -iTCP:5173 -sTCP:LISTEN        # empty output = nothing is serving
 ```
 
-**`503 missing_api_key`** (or the CLI's `LITELLM_API_KEY is not set (or is
-blank)`). No key is configured, so no request was sent. Put it in `.env` at the
+**`503 missing_api_key`** (or the CLI's `No API key is set`). No key is configured, so no request was sent. Put it in `.env` at the
 repository root, or export it in the shell you start the server from, then
 restart:
 
 ```bash
-echo "LITELLM_API_KEY=<your proxy key>" >> .env    # git-ignored, auto-loaded
+echo "GEMINI_API_KEY=<your Gemini key>" >> .env    # git-ignored, auto-loaded; or OPENAI_ / ANTHROPIC_ / LITELLM_API_KEY
 ./run.sh
 ```
 

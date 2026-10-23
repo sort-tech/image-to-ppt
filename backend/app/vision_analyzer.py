@@ -751,8 +751,9 @@ def _create_completion(
                 f"Vision request to model '{model}' failed.\n"
                 f"  first attempt (with response_format): {first_exc.__class__.__name__}: {first_exc}\n"
                 f"  retry (plain): {second_exc.__class__.__name__}: {second_exc}\n"
-                f"Check that the LiteLLM proxy at {base_url} is running and that "
-                "LITELLM_API_KEY and the model name are correct."
+                f"Check that {base_url} is reachable and that the key "
+                f"({getattr(config, 'KEY_SOURCE', 'LITELLM_API_KEY')}) and the "
+                "model name are correct."
             ) from second_exc
 
 
@@ -799,7 +800,7 @@ def analyze_image(
             # the CLI prints after this message (main._diagnose recognizes the
             # exception TYPE), so repeating it here would just double it up.
             raise VisionAnalysisError(
-                "No LiteLLM API key is configured, so the image cannot be analyzed "
+                "No API key is configured, so the image cannot be analyzed "
                 "(--from-json needs no key)."
             ) from exc
         except Exception as exc:  # noqa: BLE001

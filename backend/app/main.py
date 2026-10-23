@@ -215,7 +215,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         )
     if not config.LITELLM_API_KEY.strip():
         logger.warning(
-            "LITELLM_API_KEY is not set - real conversions will answer 503 "
+            "No API key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY or "
+            "LITELLM_API_KEY) is set - real conversions will answer 503 "
             "missing_api_key. /api/preview and /api/build-from-json still "
             "work: they build from a spec instead of calling the model."
         )

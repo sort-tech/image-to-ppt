@@ -269,7 +269,9 @@ def _connection_error_types() -> tuple[type, ...]:
     found: list[type] = []
     for module_name, attr_names in (
         ("openai", ("APIConnectionError",)),
+        ("anthropic", ("APIConnectionError",)),
         ("httpx", ("TransportError",)),
+        ("httpx2", ("TransportError",)),
     ):
         try:
             module = __import__(module_name)
@@ -292,15 +294,21 @@ _UPSTREAM_LOG_HINT = (
 )
 
 _MISSING_KEY_HINT = (
-    "Set LITELLM_API_KEY in the server's environment and restart it:\n"
-    "    export LITELLM_API_KEY='<your proxy key>'\n"
-    "POST /api/build-from-json and POST /api/preview need no key: they build "
+    "Restart the server with a key. "
+    + config.KEY_SETUP_HELP
+    + "\nPOST /api/build-from-json and POST /api/preview need no key: they build "
     "from a spec you already have."
 )
 
 
 def _proxy_unreachable_hint() -> str:
     base_url = getattr(config, "LITELLM_BASE_URL", "<unset>")
+    if getattr(config, "PROVIDER", "litellm") != "litellm":
+        return (
+            f"{base_url!r} could not be reached. Check this machine's network "
+            "connection. POST /api/build-from-json and POST /api/preview need "
+            "no network at all."
+        )
     return (
         f"LITELLM_BASE_URL is {base_url!r}. Check that the LiteLLM proxy is "
         "running and reachable at that address, or point LITELLM_BASE_URL at "
@@ -379,7 +387,7 @@ def failure_from_exception(
         return ConversionFailure(
             502,
             "proxy_unreachable",
-            "The LiteLLM proxy could not be reached "
+            "The vision model endpoint could not be reached "
             f"({type(connection).__name__}: {connection}).",
             _proxy_unreachable_hint(),
         )
@@ -908,8 +916,8 @@ def require_api_key() -> None:
         raise ConversionFailure(
             503,
             "missing_api_key",
-            "LITELLM_API_KEY is not set (or is blank) on the server, so the "
-            "LiteLLM proxy cannot be called.",
+            "No API key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY or "
+            "LITELLM_API_KEY) is set on the server, so the vision model cannot be called.",
             _MISSING_KEY_HINT,
         )
 
