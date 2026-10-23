@@ -92,6 +92,7 @@ export type ShapeKind =
   | "rectangle"
   | "rounded_rectangle"
   | "circle"
+  | "diamond"
   | "arrow_right"
   | "arrow_left"
   | "arrow_up"
@@ -248,7 +249,7 @@ interface PreviewBox {
  * as `"other"`, which the renderer draws as the shape's bounding box. The
  * arrow is in the deck; only the preview shows it square.
  */
-export type PreviewAutoShape = "rectangle" | "rounded_rectangle" | "oval" | "other";
+export type PreviewAutoShape = "rectangle" | "rounded_rectangle" | "oval" | "diamond" | "other";
 
 /**
  * A native autoshape. A null colour means "none", not "black".

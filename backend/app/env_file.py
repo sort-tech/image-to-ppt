@@ -28,7 +28,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-__all__ = ["DEFAULT_FILENAME", "find_env_file", "parse_env_text", "load_env_file"]
+__all__ = [
+    "DEFAULT_FILENAME",
+    "SKIP_ENV_VAR",
+    "find_env_file",
+    "parse_env_text",
+    "load_env_file",
+]
+
+#: Set (to anything) and the real process environment is never filled from a
+#: file. The test suite sets it: importing ``cli`` or ``app.main`` used to load
+#: a developer's ``.env`` into ``os.environ``, and any later reload of
+#: ``config`` then picked that file's provider - the very dependency on a
+#: local file the suite promises not to have.
+SKIP_ENV_VAR = "I2P_NO_DOTENV"
 
 #: The filename looked for when no explicit path is given.
 DEFAULT_FILENAME = ".env"
@@ -127,6 +140,8 @@ def load_env_file(
         there was no file, nothing parseable, or everything was already set.
         The caller can log the KEYS of this dict safely; the values are secret.
     """
+    if environ is None and os.environ.get(SKIP_ENV_VAR):
+        return {}
     target = os.environ if environ is None else environ
     resolved = Path(path) if path is not None else find_env_file()
     if resolved is None:

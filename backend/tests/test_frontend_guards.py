@@ -879,8 +879,8 @@ class TestThePlaceholderOutlineIsPreviewedDashed:
         assert 'shape.line_dash === "dashed"' in shape_node, (
             "the autoshape branch ignores the payload's dash again"
         )
-        assert shape_node.count("strokeDasharray={dashArray}") == 2, (
-            "both the ellipse and the rect have to carry the dash"
+        assert shape_node.count("strokeDasharray={dashArray}") == 3, (
+            "the ellipse, the diamond and the rect all have to carry the dash"
         )
 
     def test_the_payload_type_carries_the_field(self):

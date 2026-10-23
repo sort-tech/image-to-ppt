@@ -23,6 +23,10 @@ _PROVIDER_VARS = (
 for _name in _PROVIDER_VARS:
     os.environ.pop(_name, None)
 
+# ...and a developer's .env must not put them back: cli and app.main load it
+# into os.environ when they are imported (app/env_file.py).
+os.environ["I2P_NO_DOTENV"] = "1"
+
 
 @pytest.fixture(autouse=True)
 def _no_provider_env(monkeypatch):

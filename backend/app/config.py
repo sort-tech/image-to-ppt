@@ -77,6 +77,26 @@ PROVIDERS: dict[str, tuple[str, str, str]] = {
 }
 
 
+def _env_key(name: str) -> str:
+    """A key variable's value, with ``.env.example``'s placeholders read as unset.
+
+    ``.env.example`` ships an active ``GEMINI_API_KEY=replace-with-your-gemini-key``
+    line so Gemini is the visible default. Copied unedited, that placeholder
+    used to reach Google, which answers a 400 that reads like a malformed
+    request; as "unset" it becomes the missing-key error that names the
+    variable to fill in.
+    """
+    value = (os.environ.get(name) or "").strip()
+    lowered = value.lower()
+    if (
+        "replace-with-" in lowered
+        or (value.startswith("<") and value.endswith(">"))
+        or lowered in ("your-key", "your_key", "changeme", "xxx")
+    ):
+        return ""
+    return value
+
+
 def _resolve_provider() -> tuple[str, str, str]:
     """``(provider, key variable, how it was chosen)``; provider ``""`` = proxy.
 
@@ -99,10 +119,10 @@ def _resolve_provider() -> tuple[str, str, str]:
             f"{' | '.join(PROVIDERS)} | litellm); picking by key instead.",
             file=_sys.stderr,
         )
-    if (os.environ.get("LITELLM_API_KEY") or "").strip():
+    if _env_key("LITELLM_API_KEY"):
         return "", "LITELLM_API_KEY", "key"
     for name, (_base, key_var, _model) in PROVIDERS.items():
-        if (os.environ.get(key_var) or "").strip():
+        if _env_key(key_var):
             return name, key_var, "key"
     return "", "LITELLM_API_KEY", "none"
 
@@ -122,7 +142,7 @@ if PROVIDER:
     )
     #: The provider's own key (``GEMINI_API_KEY`` / ``OPENAI_API_KEY`` /
     #: ``ANTHROPIC_API_KEY``).
-    LITELLM_API_KEY: str = os.environ.get(_key_var, "")
+    LITELLM_API_KEY: str = _env_key(_key_var)
     #: ``PROVIDER_MODEL`` overrides the provider default. ``VISION_MODEL`` is
     #: the proxy's alias and is deliberately NOT read here: a stale
     #: ``VISION_MODEL=gemini-flash`` in .env would be sent to Google as is.
@@ -136,7 +156,7 @@ else:
     #: and a baked-in key also hides a misconfigured environment behind a 401
     #: from the proxy. Empty means "not configured" - :func:`get_client` says so,
     #: by name, while ``--from-json`` never needs a key at all.
-    LITELLM_API_KEY: str = os.environ.get("LITELLM_API_KEY", "")
+    LITELLM_API_KEY: str = _env_key("LITELLM_API_KEY")
 
     #: Vision model name routed by the proxy (env: ``VISION_MODEL``). A blank
     #: value falls back to the default - see :func:`_env_text`.

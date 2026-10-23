@@ -71,7 +71,7 @@ ELEMENT TYPES (use these exact type names and attribute names)
    {
      "type": "shape",
      "bbox": [x, y, w, h],
-     "kind": "rectangle" | "rounded_rectangle" | "circle"
+     "kind": "rectangle" | "rounded_rectangle" | "circle" | "diamond"
              | "arrow_right" | "arrow_left" | "arrow_up" | "arrow_down",
      "fill_color": "#RRGGBB" or null,
      "border_color": "#RRGGBB" or null,
@@ -83,6 +83,8 @@ ELEMENT TYPES (use these exact type names and attribute names)
    - The "arrow_*" kinds are BLOCK arrows: a thick, filled arrow BODY you could
      put a label inside, pointing right / left / up / down. A thin arrow that
      merely joins two boxes is NOT a shape - it is a "connector" (type 4).
+   - "diamond" is a rhombus, e.g. a flowchart decision box. Put its label in a
+     separate text element centred on it, like any other shape's label.
 
 2) Table - any grid of cells, ruled or unruled:
    {
@@ -190,7 +192,11 @@ ELEMENT TYPES (use these exact type names and attribute names)
      heading or table as "image". Those must stay native and editable: that is
      the entire purpose of this conversion. A chart drawn as coloured
      rectangles is shapes; a grid of printed numbers is a table; anything you
-     can read is text.
+     can read is text. A plain geometric shape - rectangle, rounded box,
+     circle, diamond, block arrow - is ALWAYS a "shape", never an "image".
+   - The crop already contains everything drawn inside its "bbox", so do NOT
+     also emit text or shapes that lie inside an "image" region: they would be
+     drawn twice, one copy over the other.
    - NEVER emit one "image" covering the whole slide (or most of it), and never
      a few big "image" regions that together tile the slide. That flattens the
      slide into a screenshot and destroys every editable object; such output is
@@ -707,6 +713,24 @@ def _looks_like_response_format_rejection(exc: Exception) -> bool:
     )
 
 
+#: How providers word "this key is wrong" - Google answers a 400, not a 401.
+_BAD_KEY_TOKENS = (
+    "api key not valid",
+    "valid api key",
+    "api_key_invalid",
+    "invalid api key",
+    "incorrect api key",
+    "invalid x-api-key",
+    "authenticationerror",
+    "401",
+)
+
+
+def _looks_like_bad_key(exc: Exception) -> bool:
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    return any(token in text for token in _BAD_KEY_TOKENS)
+
+
 def _create_completion(
     client: Any, model: str, messages: list[dict], verbose: bool = False
 ) -> Any:
@@ -735,6 +759,15 @@ def _create_completion(
             response_format={"type": "json_object"},
         )
     except Exception as first_exc:  # noqa: BLE001 - any client/proxy error is retried once
+        if _looks_like_bad_key(first_exc):
+            # Retrying without response_format cannot fix a key, and the retry
+            # log would blame JSON mode for what is a credential problem.
+            source = getattr(config, "KEY_SOURCE", "LITELLM_API_KEY")
+            raise VisionAnalysisError(
+                f"The provider rejected the API key ({source}): "
+                f"{first_exc.__class__.__name__}: {first_exc}\n"
+                f"Check that {source} holds a valid key, not a placeholder."
+            ) from first_exc
         reason = "rejected response_format" if _looks_like_response_format_rejection(first_exc) else "failed"
         _warn(
             f"model '{model}' {reason} "

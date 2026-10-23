@@ -111,9 +111,10 @@ via `POST /api/build-from-json` or `--from-json`.
 
 Element types and fields:
 
-- **`shape`** - `kind` is `rectangle` (default), `rounded_rectangle`, `circle`
-  or one of the block arrows `arrow_right` / `arrow_left` / `arrow_up` /
-  `arrow_down`; `fill_color`, `border_color`, `border_width`. A shape with no
+- **`shape`** - `kind` is `rectangle` (default), `rounded_rectangle`, `circle`,
+  `diamond` (a flowchart decision box) or one of the block arrows
+  `arrow_right` / `arrow_left` / `arrow_up` / `arrow_down`; `fill_color`,
+  `border_color`, `border_width`. A shape with no
   `fill_color` is drawn *unfilled*, so it can frame content painted later.
   Shapes never carry text.
 - **`table`** - `data` is a 2-D array of strings; ragged rows are padded with

@@ -116,6 +116,7 @@ SHAPE_MAP: dict[str, MSO_SHAPE] = {
     "rectangle": MSO_SHAPE.RECTANGLE,
     "rounded_rectangle": MSO_SHAPE.ROUNDED_RECTANGLE,
     "circle": MSO_SHAPE.OVAL,
+    "diamond": MSO_SHAPE.DIAMOND,
     # Block arrows: real auto shapes with text frames and handles, not connectors.
     "arrow_right": MSO_SHAPE.RIGHT_ARROW,
     "arrow_left": MSO_SHAPE.LEFT_ARROW,

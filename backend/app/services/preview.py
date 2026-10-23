@@ -91,6 +91,7 @@ _AUTOSHAPE_NAMES: dict[str, str] = {
     "RECTANGLE": "rectangle",
     "ROUNDED_RECTANGLE": "rounded_rectangle",
     "OVAL": "oval",
+    "DIAMOND": "diamond",
 }
 
 #: Paragraph alignment -> the contract's three values. ``JUSTIFY`` and friends

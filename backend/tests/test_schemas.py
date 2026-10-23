@@ -1449,6 +1449,7 @@ class TestLlmJsonSchemaDescribesTheNewTypes:
             "rectangle",
             "rounded_rectangle",
             "circle",
+            "diamond",
             "arrow_right",
             "arrow_left",
             "arrow_up",

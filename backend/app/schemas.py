@@ -59,6 +59,9 @@ ShapeKind = Literal[
     "rectangle",
     "rounded_rectangle",
     "circle",
+    # A flowchart decision box. Without it the model had no native way to draw
+    # one and cropped it out of the source as an ``image``.
+    "diamond",
     # Block arrows: a thick, filled arrow BODY, not a line. A thin diagram
     # arrow joining two boxes is a ``connector`` instead.
     "arrow_right",
@@ -444,6 +447,10 @@ _KIND_ALIASES = {
     "down-arrow": "arrow_down",
     "downarrow": "arrow_down",
     "block_arrow_down": "arrow_down",
+    "diamond": "diamond",
+    "rhombus": "diamond",
+    "decision": "diamond",
+    "flowchart_decision": "diamond",
 }
 
 _CONNECTOR_KIND_ALIASES = {
@@ -1233,6 +1240,7 @@ def llm_json_schema() -> dict:
                                         "rectangle",
                                         "rounded_rectangle",
                                         "circle",
+                                        "diamond",
                                         "arrow_right",
                                         "arrow_left",
                                         "arrow_up",

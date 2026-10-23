@@ -191,6 +191,18 @@ function AutoShapeNode({
     );
   }
 
+  if (shape.autoshape === "diamond") {
+    return (
+      <polygon
+        points={`${x + w / 2},${y} ${x + w},${y + h / 2} ${x + w / 2},${y + h} ${x},${y + h / 2}`}
+        fill={fill}
+        stroke={stroke}
+        strokeWidth={strokeWidth}
+        strokeDasharray={dashArray}
+      />
+    );
+  }
+
   const radius =
     shape.autoshape === "rounded_rectangle" ? Math.min(w, h) * ROUNDED_ADJUSTMENT : 0;
 
