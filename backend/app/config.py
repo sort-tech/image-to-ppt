@@ -41,6 +41,7 @@ __all__ = [
     "LITELLM_API_KEY",
     "KEY_SOURCE",
     "PROVIDER",
+    "PROVIDERS",
     "KEY_SETUP_HELP",
     "MissingApiKeyError",
     "DEFAULT_MODEL",
@@ -58,70 +59,88 @@ __all__ = [
 ]
 
 # --------------------------------------------------------------------------- #
-# LLM settings: a LiteLLM proxy, or Gemini / OpenAI directly
+# LLM settings: a LiteLLM proxy, or Gemini / OpenAI / Claude directly
 # --------------------------------------------------------------------------- #
 
-#: Where a key can come from, first match wins:
-#: ``(env var, provider, base URL, default model)``. The proxy comes first so an
-#: existing LiteLLM setup behaves exactly as before; the other two are there so
-#: that trying the project needs one provider key and no proxy at all - both
-#: providers speak the OpenAI chat API this client already uses. A base URL of
-#: ``None`` means "read ``LITELLM_BASE_URL``".
-_KEY_SOURCES: tuple[tuple[str, str, str | None, str], ...] = (
-    ("LITELLM_API_KEY", "litellm", None, "gemini-flash"),
-    (
-        "GEMINI_API_KEY",
-        "gemini",
+#: Direct providers: name -> (base URL, that provider's own key variable,
+#: default vision model). Gemini and OpenAI speak the OpenAI chat API this
+#: client already uses; Claude goes through the official ``anthropic`` SDK, not
+#: a compatibility endpoint - see app/anthropic_client.py.
+PROVIDERS: dict[str, tuple[str, str, str]] = {
+    "gemini": (
         "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "GEMINI_API_KEY",
         "gemini-3.8-flash",
     ),
-    ("OPENAI_API_KEY", "openai", "https://api.openai.com/v1/", "gpt-4.1-mini"),
-    # Claude goes through the official ``anthropic`` SDK, not a compatibility
-    # endpoint - see app/anthropic_client.py.
-    ("ANTHROPIC_API_KEY", "anthropic", "https://api.anthropic.com/", "claude-opus-5-5"),
-)
+    "openai": ("https://api.openai.com/v1/", "OPENAI_API_KEY", "gpt-4o-mini"),
+    "anthropic": ("https://api.anthropic.com/", "ANTHROPIC_API_KEY", "claude-opus-5-5"),
+}
 
 
-def _resolve_key_source() -> tuple[str, str, str, str, str]:
-    """``(env var, provider, key, base URL, default model)`` for this process.
+def _resolve_provider() -> tuple[str, str, str]:
+    """``(provider, key variable, how it was chosen)``; provider ``""`` = proxy.
 
-    With no key anywhere the proxy is reported, key empty, so every "not
-    configured" message keeps naming the variables to set.
+    ``PROVIDER=gemini|openai|anthropic`` picks one explicitly and
+    ``PROVIDER=litellm`` forces the proxy. Unset, the first key present wins -
+    ``LITELLM_API_KEY`` first, so an existing proxy setup is never redirected by
+    a provider key exported for some other tool - and one key is all a
+    first-time user has to set.
     """
-    for name, provider, base_url, model in _KEY_SOURCES:
-        key = (os.environ.get(name) or "").strip()
-        if key:
-            break
-    else:
-        name, provider, base_url, model = _KEY_SOURCES[0]
-        key = ""
-    if base_url is None:
-        # Only the proxy reads LITELLM_BASE_URL: a stale proxy URL left in .env
-        # must not send a Gemini key to localhost:4000.
-        base_url = _env_text("LITELLM_BASE_URL", "http://localhost:4000/")
-    elif provider == "anthropic":
-        # The anthropic SDK reads ANTHROPIC_BASE_URL itself; mirror it so the
-        # endpoint /api/health and the error hints name is the one called.
-        base_url = _env_text("ANTHROPIC_BASE_URL", base_url)
-    return name, provider, key, base_url, model
+    chosen = _env_text("PROVIDER", "").lower()
+    if chosen in ("litellm", "proxy"):
+        return "", "LITELLM_API_KEY", "PROVIDER"
+    if chosen in PROVIDERS:
+        return chosen, PROVIDERS[chosen][1], "PROVIDER"
+    if chosen:
+        import sys as _sys
+
+        print(
+            f"[config] WARNING: unknown PROVIDER {chosen!r} (use "
+            f"{' | '.join(PROVIDERS)} | litellm); picking by key instead.",
+            file=_sys.stderr,
+        )
+    if (os.environ.get("LITELLM_API_KEY") or "").strip():
+        return "", "LITELLM_API_KEY", "key"
+    for name, (_base, key_var, _model) in PROVIDERS.items():
+        if (os.environ.get(key_var) or "").strip():
+            return name, key_var, "key"
+    return "", "LITELLM_API_KEY", "none"
 
 
-(KEY_SOURCE, PROVIDER, LITELLM_API_KEY, LITELLM_BASE_URL, _PROVIDER_MODEL) = (
-    _resolve_key_source()
-)
-#: ``KEY_SOURCE`` is the variable that supplied the key and ``PROVIDER`` one of
-#: ``litellm`` / ``gemini`` / ``openai`` / ``anthropic``. ``LITELLM_API_KEY`` and
-#: ``LITELLM_BASE_URL`` keep their names for every caller, but hold the
-#: EFFECTIVE key and endpoint, whichever source supplied them. There is
-#: deliberately NO default key: a credential does not belong in the source
-#: tree, and a baked-in key also hides a misconfigured environment behind a
-#: 401. Empty means "not configured" - :func:`get_client` says so, by name,
-#: while ``--from-json`` never needs a key at all.
+#: Selected direct provider, ``""`` = LiteLLM proxy mode (env: ``PROVIDER``,
+#: else picked by key). ``KEY_SOURCE`` names the variable the key comes from.
+PROVIDER, KEY_SOURCE, _CHOSEN_BY = _resolve_provider()
 
-#: Vision model name (env: ``VISION_MODEL``): an alias the proxy routes, or the
-#: provider's own model name when calling Gemini / OpenAI directly. A blank
-#: value falls back to the provider's default - see :func:`_env_text`.
-DEFAULT_MODEL: str = _env_text("VISION_MODEL", _PROVIDER_MODEL)
+if PROVIDER:
+    _base, _key_var, _default_model = PROVIDERS[PROVIDER]
+    #: Base URL of the endpoint. Only the proxy reads LITELLM_BASE_URL: a stale
+    #: proxy URL left in .env must not receive a provider key. The anthropic
+    #: SDK reads ANTHROPIC_BASE_URL itself; it is mirrored so /api/health and
+    #: the error hints name the endpoint really called.
+    LITELLM_BASE_URL: str = (
+        _env_text("ANTHROPIC_BASE_URL", _base) if PROVIDER == "anthropic" else _base
+    )
+    #: The provider's own key (``GEMINI_API_KEY`` / ``OPENAI_API_KEY`` /
+    #: ``ANTHROPIC_API_KEY``).
+    LITELLM_API_KEY: str = os.environ.get(_key_var, "")
+    #: ``PROVIDER_MODEL`` overrides the provider default. ``VISION_MODEL`` is
+    #: the proxy's alias and is deliberately NOT read here: a stale
+    #: ``VISION_MODEL=gemini-flash`` in .env would be sent to Google as is.
+    DEFAULT_MODEL: str = _env_text("PROVIDER_MODEL", _default_model)
+else:
+    #: Base URL of the OpenAI-compatible LiteLLM proxy (env: ``LITELLM_BASE_URL``).
+    LITELLM_BASE_URL: str = _env_text("LITELLM_BASE_URL", "http://localhost:4000/")
+
+    #: API key presented to the proxy (env: ``LITELLM_API_KEY``). There is
+    #: deliberately NO default: a credential does not belong in the source tree,
+    #: and a baked-in key also hides a misconfigured environment behind a 401
+    #: from the proxy. Empty means "not configured" - :func:`get_client` says so,
+    #: by name, while ``--from-json`` never needs a key at all.
+    LITELLM_API_KEY: str = os.environ.get("LITELLM_API_KEY", "")
+
+    #: Vision model name routed by the proxy (env: ``VISION_MODEL``). A blank
+    #: value falls back to the default - see :func:`_env_text`.
+    DEFAULT_MODEL: str = _env_text("VISION_MODEL", "gemini-flash")
 
 #: The ways to configure a key, for every "no key" message to quote.
 KEY_SETUP_HELP = (
@@ -129,7 +148,8 @@ KEY_SETUP_HELP = (
     "    export GEMINI_API_KEY='<your Gemini key>'    # https://aistudio.google.com/apikey\n"
     "    export OPENAI_API_KEY='<your OpenAI key>'\n"
     "    export ANTHROPIC_API_KEY='<your Anthropic key>'\n"
-    "    export LITELLM_API_KEY='<your proxy key>'    # a LiteLLM proxy at LITELLM_BASE_URL"
+    "    export LITELLM_API_KEY='<your proxy key>'    # a LiteLLM proxy at LITELLM_BASE_URL\n"
+    "  With several set, PROVIDER=gemini|openai|anthropic|litellm picks one."
 )
 
 #: Per-request timeout in seconds. Vision calls on large images are slow.

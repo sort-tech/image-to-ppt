@@ -15,9 +15,11 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // Bind-mounted sources inside Docker on macOS/Windows emit no fs events.
+    watch: process.env.CHOKIDAR_USEPOLLING ? { usePolling: true } : undefined,
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: process.env.API_PROXY_TARGET ?? "http://localhost:8000",
         changeOrigin: true,
       },
     },

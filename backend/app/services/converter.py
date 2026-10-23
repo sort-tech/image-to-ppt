@@ -303,7 +303,7 @@ _MISSING_KEY_HINT = (
 
 def _proxy_unreachable_hint() -> str:
     base_url = getattr(config, "LITELLM_BASE_URL", "<unset>")
-    if getattr(config, "PROVIDER", "litellm") != "litellm":
+    if getattr(config, "PROVIDER", ""):
         return (
             f"{base_url!r} could not be reached. Check this machine's network "
             "connection. POST /api/build-from-json and POST /api/preview need "

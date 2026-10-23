@@ -162,6 +162,9 @@ class TestTheLiteralKeyIsNotInTheSourceTree:
 
 
 _KEY_VARS = ("LITELLM_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+_OTHER_VARS = (
+    "PROVIDER", "PROVIDER_MODEL", "LITELLM_BASE_URL", "VISION_MODEL", "ANTHROPIC_BASE_URL"
+)
 
 
 class TestOneProviderKeyIsEnough:
@@ -172,14 +175,14 @@ class TestOneProviderKeyIsEnough:
         import importlib
 
         def _reload(**env):
-            for name in (*_KEY_VARS, "LITELLM_BASE_URL", "VISION_MODEL"):
+            for name in (*_KEY_VARS, *_OTHER_VARS):
                 monkeypatch.delenv(name, raising=False)
             for name, value in env.items():
                 monkeypatch.setenv(name, value)
             return importlib.reload(config)
 
         yield _reload
-        for name in (*_KEY_VARS, "LITELLM_BASE_URL", "VISION_MODEL"):
+        for name in (*_KEY_VARS, *_OTHER_VARS):
             monkeypatch.delenv(name, raising=False)
         importlib.reload(config)
 
@@ -203,7 +206,7 @@ class TestOneProviderKeyIsEnough:
         reloaded = reload_with(
             LITELLM_API_KEY="sk-proxy", GEMINI_API_KEY="g-key", OPENAI_API_KEY="o-key"
         )
-        assert (reloaded.PROVIDER, reloaded.LITELLM_API_KEY) == ("litellm", "sk-proxy")
+        assert (reloaded.PROVIDER, reloaded.LITELLM_API_KEY) == ("", "sk-proxy")
         assert reloaded.LITELLM_BASE_URL == "http://localhost:4000/"
         assert reloaded.DEFAULT_MODEL == "gemini-flash"
 
@@ -220,9 +223,27 @@ class TestOneProviderKeyIsEnough:
         )
         assert "localhost" not in reloaded.LITELLM_BASE_URL
 
-    def test_vision_model_still_overrides_the_provider_default(self, reload_with):
-        reloaded = reload_with(GEMINI_API_KEY="g", VISION_MODEL="gemini-2.5-pro")
-        assert reloaded.DEFAULT_MODEL == "gemini-2.5-pro"
+    def test_provider_model_overrides_the_default_and_the_proxy_alias_does_not(
+        self, reload_with
+    ):
+        """VISION_MODEL is the proxy's alias; a stale one must not reach Google."""
+        assert reload_with(GEMINI_API_KEY="g", VISION_MODEL="gemini-flash").DEFAULT_MODEL == (
+            "gemini-3.8-flash"
+        )
+        reloaded = reload_with(GEMINI_API_KEY="g", PROVIDER_MODEL="gemini-3.7-flash")
+        assert reloaded.DEFAULT_MODEL == "gemini-3.7-flash"
+
+    def test_an_explicit_provider_beats_key_order(self, reload_with):
+        reloaded = reload_with(
+            PROVIDER="anthropic", LITELLM_API_KEY="p", GEMINI_API_KEY="g", ANTHROPIC_API_KEY="a"
+        )
+        assert (reloaded.PROVIDER, reloaded.LITELLM_API_KEY) == ("anthropic", "a")
+
+    def test_provider_litellm_forces_the_proxy_even_with_only_a_provider_key(
+        self, reload_with
+    ):
+        reloaded = reload_with(PROVIDER="litellm", GEMINI_API_KEY="g")
+        assert (reloaded.PROVIDER, reloaded.LITELLM_API_KEY) == ("", "")
 
     def test_an_anthropic_key_alone_calls_claude_through_its_own_sdk(self, reload_with):
         reloaded = reload_with(ANTHROPIC_API_KEY="a-test-key")
@@ -340,3 +361,57 @@ class TestTheOfflinePathsNeedNoKey:
         out = tmp_path / "fromjson.pptx"
         assert cli.main(["--from-json", str(spec), "-o", str(out)]) == 0
         assert out.is_file() and out.stat().st_size > 0
+
+
+class TestDirectProvider:
+    """PROVIDER=gemini|openai talks to the provider itself, no LiteLLM proxy."""
+
+    @staticmethod
+    def _reload(monkeypatch, **env):
+        import importlib
+
+        for name in ("PROVIDER", "PROVIDER_MODEL", "GEMINI_API_KEY", "OPENAI_API_KEY",
+                     "LITELLM_BASE_URL", "LITELLM_API_KEY", "VISION_MODEL"):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        return importlib.reload(config)
+
+    def teardown_method(self):
+        import importlib
+
+        importlib.reload(config)
+
+    def test_gemini_uses_its_endpoint_key_and_default_model(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="gemini", GEMINI_API_KEY="g-key")
+        assert cfg.LITELLM_BASE_URL.startswith("https://generativelanguage.googleapis.com/")
+        assert cfg.LITELLM_API_KEY == "g-key"
+        assert cfg.DEFAULT_MODEL == "gemini-3.8-flash"
+
+    def test_openai_and_model_override(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="OpenAI", OPENAI_API_KEY="o-key",
+                           PROVIDER_MODEL="gpt-4o")
+        assert cfg.LITELLM_BASE_URL == "https://api.openai.com/v1/"
+        assert (cfg.LITELLM_API_KEY, cfg.DEFAULT_MODEL) == ("o-key", "gpt-4o")
+
+    def test_provider_wins_over_proxy_settings_and_ignores_the_other_key(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="gemini", GEMINI_API_KEY="g",
+                           OPENAI_API_KEY="o", LITELLM_API_KEY="proxy",
+                           LITELLM_BASE_URL="http://proxy:4000/", VISION_MODEL="alias")
+        assert (cfg.LITELLM_API_KEY, cfg.DEFAULT_MODEL) == ("g", "gemini-3.8-flash")
+        assert "proxy" not in cfg.LITELLM_BASE_URL
+
+    def test_missing_provider_key_is_the_normal_missing_key_error(self, monkeypatch):
+        cfg = self._reload(monkeypatch, PROVIDER="gemini")
+        with pytest.raises(cfg.MissingApiKeyError):
+            cfg.get_client()
+
+    @pytest.mark.parametrize("value", ["", "litellm", "  "])
+    def test_unset_or_litellm_keeps_proxy_mode(self, monkeypatch, value):
+        cfg = self._reload(monkeypatch, PROVIDER=value, LITELLM_API_KEY="p")
+        assert cfg.PROVIDER == "" and cfg.LITELLM_API_KEY == "p"
+        assert cfg.DEFAULT_MODEL == "gemini-flash"
+
+    def test_unknown_provider_warns_and_falls_back(self, monkeypatch, capsys):
+        cfg = self._reload(monkeypatch, PROVIDER="gemni")
+        assert cfg.PROVIDER == "" and "unknown PROVIDER" in capsys.readouterr().err

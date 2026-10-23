@@ -1,0 +1,20 @@
+# DEVELOP: source mounted, backend --reload, Vite HMR. Use as an override:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  backend:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./backend:/app/backend
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    environment:
+      API_PROXY_TARGET: http://backend:8000
+      CHOKIDAR_USEPOLLING: "true"
+    ports: !override
+      - "${WEB_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules

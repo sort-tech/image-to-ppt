@@ -18,7 +18,9 @@
 # target (frontend/vite.config.ts), so prefer freeing the default port.
 #
 # Env read (never written to a file - see README.md):
-#   GEMINI_API_KEY | OPENAI_API_KEY | ANTHROPIC_API_KEY | LITELLM_API_KEY (+ LITELLM_BASE_URL)  VISION_MODEL
+#   PROVIDER=gemini|openai|anthropic|litellm (optional; else picked by key)
+#   GEMINI_API_KEY | OPENAI_API_KEY | ANTHROPIC_API_KEY  PROVIDER_MODEL
+#   or a proxy: LITELLM_API_KEY  LITELLM_BASE_URL  VISION_MODEL
 #
 set -euo pipefail
 
@@ -149,21 +151,16 @@ load_env_file() {
 }
 
 check_api_key() {
-    # Same order as backend/app/config.py: the proxy key, then a direct
-    # provider key. Only the proxy reads LITELLM_BASE_URL.
-    local source="" endpoint="${LITELLM_BASE_URL:-http://localhost:4000/}" model="gemini-flash"
-    if [ -n "${LITELLM_API_KEY:-}" ]; then
-        source="LITELLM_API_KEY"
-    elif [ -n "${GEMINI_API_KEY:-}" ]; then
-        source="GEMINI_API_KEY" endpoint="Gemini API (direct)" model="gemini-3.8-flash"
-    elif [ -n "${OPENAI_API_KEY:-}" ]; then
-        source="OPENAI_API_KEY" endpoint="OpenAI API (direct)" model="gpt-4.1-mini"
-    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-        source="ANTHROPIC_API_KEY" endpoint="Anthropic API (direct)" model="claude-opus-5-5"
-    fi
-    if [ -z "$source" ]; then
-        warn "no API key is set - starting anyway.
-           Converting an image needs one: POST /api/convert and 'python cli.py -i'
+    # Ask backend/app/config.py which provider, key variable, endpoint and model
+    # it resolved, rather than keeping a second copy of its rules here. It has
+    # no dependencies, and prints names only - never a key.
+    local resolved source has_key endpoint model
+    resolved="$(cd "$ROOT/backend" && "$VENV_PY" -c 'from app import config
+print(config.KEY_SOURCE, int(bool(config.LITELLM_API_KEY.strip())), config.LITELLM_BASE_URL, config.DEFAULT_MODEL)')" || resolved=""
+    read -r source has_key endpoint model <<<"$resolved"
+    if [ "${has_key:-0}" != 1 ]; then
+        warn "${source:-LITELLM_API_KEY} is unset (or blank) - starting anyway.
+           Converting an image needs a key: POST /api/convert and 'python cli.py -i'
            come back 503/exit non-zero with missing_api_key until you set one. The
            spec-driven paths need none and keep working: POST /api/preview,
            POST /api/build-from-json, 'python cli.py --from-json', GET /api/health
@@ -176,7 +173,7 @@ check_api_key() {
     else
         log "$source is set (value not shown)."
     fi
-    log "endpoint: $endpoint   model: ${VISION_MODEL:-$model}"
+    log "endpoint: ${endpoint:-?}   model: ${model:-?}"
 }
 
 # --------------------------------------------------------------------------- #

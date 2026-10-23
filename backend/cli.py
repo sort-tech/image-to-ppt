@@ -435,7 +435,7 @@ def _diagnose(exc: BaseException, context: str = "llm") -> str:
             + (
                 "  Fix: list the proxy's models (e.g. curl "
                 f"{config.LITELLM_BASE_URL.rstrip('/')}/v1/models) and pass one with --model."
-                if config.PROVIDER == "litellm"
+                if not config.PROVIDER
                 else f"  Fix: pass a {config.PROVIDER} vision model name with --model."
             )
         )
@@ -460,7 +460,7 @@ def _diagnose(exc: BaseException, context: str = "llm") -> str:
         "unreachable",
         "getaddrinfo",
     ):
-        if config.PROVIDER != "litellm":
+        if config.PROVIDER:
             return (
                 f"Could not reach {config.LITELLM_BASE_URL}.\n"
                 "  Fix: check this machine's network connection and retry.\n"
@@ -737,7 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             applied = ", ".join(sorted(ENV_APPLIED)) or "nothing (already in the environment)"
             print(f"[verbose] .env        : {ENV_FILE} -> {applied}", file=sys.stderr)
         print(f"[verbose] base url    : {config.LITELLM_BASE_URL}", file=sys.stderr)
-        print(f"[verbose] key source  : {config.KEY_SOURCE} ({config.PROVIDER})", file=sys.stderr)
+        print(f"[verbose] key source  : {config.KEY_SOURCE} ({config.PROVIDER or 'litellm proxy'})", file=sys.stderr)
         print(
             f"[verbose] model       : {args.model or config.DEFAULT_MODEL}",
             file=sys.stderr,
