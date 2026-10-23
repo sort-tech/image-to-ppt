@@ -12,6 +12,13 @@ editable PowerPoint objects**: you can click the table and retype a cell, drag
 a box, restyle the header, re-point an arrow. Many "image to PPT" converters
 paste your picture onto a slide; this one refuses to.
 
+![A screenshot of a slide on the left, the converted PowerPoint slide on the right](docs/images/before-after.png)
+
+<p align="center">
+  <img src="docs/images/editable-objects.gif" width="720"
+       alt="The converted slide with its table, shapes and text boxes highlighted one group at a time - each is a separate, editable PowerPoint object">
+</p>
+
 | | typical image-to-PPT converter | image-to-pptx |
 | --- | --- | --- |
 | table | a picture of a table | a PowerPoint table - retype any cell |
